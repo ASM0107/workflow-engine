@@ -43,3 +43,31 @@
 - **Consequences**:
   - Prevents state conflation between graph topology and runtime attempts.
   - Enforces atomic transitions governed by well-defined state machines.
+
+## ADR-005: Dedicated Local PostgreSQL Cluster for Deterministic Integration Testing
+- **Context**: Real database integration testing was required for constraints, indexes, migrations, and transactional isolation without relying on mocked databases.
+- **Decision**: Initialize a standalone, isolated PostgreSQL 18 instance running in user-space at `projects/workflow-engine/pgdata` on port 5433 with trust authentication for `engine_user`.
+- **Consequences**:
+  - Eliminates dependency on host service state or Docker Desktop permissions.
+  - Provides identical execution environment across developer sessions and automated testing.
+  - Excluded via `.gitignore` to prevent repository bloat while preserving reproducible migration scripts.
+
+## ADR-006: Atomic Run Creation and Immutable Workflow Versioning
+- **Context**: Workflow execution state must remain completely isolated from subsequent workflow authoring or modifications. Starting a run must create an atomic snapshot.
+- **Decision**:
+  - Publish workflows into immutable version records (`workflow_versions`). Workflow modifications produce a new version number; existing versions cannot be mutated or deleted.
+  - Create runs inside a single database transaction: insert the `runs` record with initial status `QUEUED`, populate all `node_runs` and `edge_runs`, and immediately promote root nodes to `READY` while keeping downstream nodes `PENDING`.
+- **Consequences**:
+  - Eliminates half-initialized run states or orphan records.
+  - Guarantees execution traceability: runs always point to an exact immutable definition snapshot.
+
+## ADR-007: Partial Indexes for Fair Run Scheduling and Fenced Leases
+- **Context**: High-frequency worker polling and claiming on `node_runs` and `runs` could degrade as history tables grow.
+- **Decision**: Create targeted partial indexes:
+  1. `idx_runs_claimable`: `runs (last_claimed_at ASC NULLS FIRST, created_at ASC) WHERE status IN ('QUEUED', 'RUNNING')` for starvation-free round-robin run discovery.
+  2. `idx_node_runs_ready`: `node_runs (run_id, run_after) WHERE status = 'READY'` for instant ready node candidate lookup.
+  3. `idx_node_runs_running_lease`: `node_runs (run_id, lease_expires_at) WHERE status = 'RUNNING'` for fast expired lease recovery.
+- **Consequences**:
+  - Index size remains bounded proportional to active workload, not cumulative history.
+  - Query plans consistently utilize index scans even across high-volume terminal history.
+

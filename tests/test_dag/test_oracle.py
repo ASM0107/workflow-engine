@@ -132,15 +132,15 @@ def test_claim_mechanics_and_lease_generation(linear_workflow: WorkflowDefinitio
 
 
 def test_oracle_wide_fan_out_and_reconverge() -> None:
-    parallel_count = 10
+    parallel_branch_count = 10
     nodes = {
         "root": Node(id="root", type=NodeType.MANUAL_TRIGGER),
         "sink": Node(id="sink", type=NodeType.JSON_TRANSFORM),
     }
     edges = {}
 
-    for i in range(parallel_count):
-        node_id = f"worker_{i}"
+    for i in range(parallel_branch_count):
+        node_id = f"branch_{i}"
         nodes[node_id] = Node(id=node_id, type=NodeType.HTTP)
         edges[f"e_root_{node_id}"] = Edge(
             id=f"e_root_{node_id}", from_node_id="root", to_node_id=node_id
@@ -153,8 +153,8 @@ def test_oracle_wide_fan_out_and_reconverge() -> None:
     run = execute_reference_workflow(wf)
 
     assert run.status == RunState.SUCCEEDED
-    for i in range(parallel_count):
-        assert run.node_states[f"worker_{i}"].status == NodeState.SUCCEEDED
+    for i in range(parallel_branch_count):
+        assert run.node_states[f"branch_{i}"].status == NodeState.SUCCEEDED
     assert run.node_states["sink"].status == NodeState.SUCCEEDED
 
 

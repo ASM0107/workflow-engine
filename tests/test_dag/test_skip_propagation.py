@@ -101,3 +101,27 @@ def test_propagation_terminates_at_fixed_point_without_extra_work(
 
     second_skipped = propagate_multi_hop_skips(run, deep_cascade_workflow)
     assert second_skipped == []
+
+
+def test_skip_propagation_defensive_root_and_no_incoming_handling() -> None:
+    wf = WorkflowDefinition(
+        id="wf_defensive",
+        version=1,
+        nodes={
+            "root": Node(id="root", type=NodeType.MANUAL_TRIGGER),
+            "isolated": Node(id="isolated", type=NodeType.JSON_TRANSFORM),
+            "child": Node(id="child", type=NodeType.HTTP),
+        },
+        edges={
+            "e_root_child": Edge(id="e_root_child", from_node_id="root", to_node_id="child"),
+        },
+    )
+    run = create_run(wf)
+    run.node_states["root"].status = NodeState.PENDING
+    run.node_states["isolated"].status = NodeState.PENDING
+
+    skipped = propagate_multi_hop_skips(run, wf)
+
+    assert skipped == []
+    assert run.node_states["root"].status == NodeState.PENDING
+    assert run.node_states["isolated"].status == NodeState.PENDING

@@ -30,6 +30,22 @@ class UnknownEdgeError(WorkflowEngineError):
     pass
 
 
+class WorkflowNotFoundError(WorkflowEngineError):
+    pass
+
+
+class VersionNotFoundError(WorkflowEngineError):
+    pass
+
+
+class DuplicateVersionError(WorkflowEngineError):
+    pass
+
+
+class RunNotFoundError(WorkflowEngineError):
+    pass
+
+
 class InvalidNodeStateTransitionError(WorkflowEngineError):
     def __init__(self, node_id: str, current_state: str, attempted_state: str) -> None:
         self.node_id = node_id
