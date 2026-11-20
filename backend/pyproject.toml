@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "workflow-engine-backend"
+version = "0.1.0"
+description = "Durable DAG-based workflow orchestration system - Backend"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7.0",
+    "jmespath>=1.0.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["../tests"]
+pythonpath = ["src"]
+addopts = "-v --strict-markers"
+asyncio_mode = "auto"
