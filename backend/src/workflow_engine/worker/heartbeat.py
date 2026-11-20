@@ -20,7 +20,14 @@ class HeartbeatService:
             extension_seconds if extension_seconds is not None else self.default_extension_seconds
         )
 
-        query = """
+        query_lock_run = """
+            SELECT id, status
+            FROM runs
+            WHERE id = %s
+            FOR UPDATE;
+        """
+
+        query_update_lease = """
             UPDATE node_runs
             SET lease_expires_at = clock_timestamp() + (%s * INTERVAL '1 second'),
                 updated_at = clock_timestamp()
@@ -28,13 +35,22 @@ class HeartbeatService:
               AND lease_owner = %s
               AND lease_generation = %s
               AND status = 'RUNNING'
+              AND lease_expires_at > clock_timestamp()
             RETURNING lease_expires_at;
         """
 
         with get_connection() as conn:
             with conn.cursor() as cur:
+                cur.execute(query_lock_run, (claimed_node.run_id,))
+                run_row = cur.fetchone()
+                if not run_row or run_row["status"] != "RUNNING":
+                    conn.rollback()
+                    raise FencingTokenError(
+                        f"Parent run '{claimed_node.run_id}' not RUNNING. Heartbeat rejected."
+                    )
+
                 cur.execute(
-                    query,
+                    query_update_lease,
                     (
                         extension,
                         claimed_node.node_run_id,
@@ -46,8 +62,8 @@ class HeartbeatService:
                 if not row:
                     conn.rollback()
                     raise FencingTokenError(
-                        f"Lease lost for node '{claimed_node.node_key}' "
-                        f"(generation {claimed_node.lease_generation}). Execution must abort."
+                        f"Lease lost or expired for node '{claimed_node.node_key}' "
+                        f"(generation {claimed_node.lease_generation}). Heartbeat rejected."
                     )
                 conn.commit()
                 new_expiry: datetime = row["lease_expires_at"]

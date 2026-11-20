@@ -55,11 +55,7 @@ def query_and_print_run_state(run_id: str) -> None:
             nodes = cur.fetchall()
             print("   [NODE_RUNS]")
             for n in nodes:
-                expiry = (
-                    str(n["lease_expires_at"])[11:19]
-                    if n["lease_expires_at"]
-                    else "None"
-                )
+                expiry = str(n["lease_expires_at"])[11:19] if n["lease_expires_at"] else "None"
                 owner_str = str(n["lease_owner"]) if n["lease_owner"] else "None"
                 print(
                     f"     - {n['node_key']:<18} | status={n['status']:<9} "
@@ -160,9 +156,7 @@ def execute_live_demonstration() -> None:
         "e1": Edge(id="e1", from_node_id="verify_order", to_node_id="process_payment"),
         "e2": Edge(id="e2", from_node_id="process_payment", to_node_id="send_receipt"),
     }
-    definition = WorkflowDefinition(
-        id="wf_order_pipeline", version=1, nodes=nodes, edges=edges
-    )
+    definition = WorkflowDefinition(id="wf_order_pipeline", version=1, nodes=nodes, edges=edges)
 
     workflow_id = workflow_repo.create_workflow(
         name="Order Fulfillment Pipeline",

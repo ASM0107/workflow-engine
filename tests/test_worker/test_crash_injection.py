@@ -9,7 +9,7 @@ from workflow_engine.persistence.repositories import RunRepository
 from workflow_engine.worker.claim import ClaimEngine
 from workflow_engine.worker.completion import CompletionEngine
 from workflow_engine.worker.sweeper import LeaseRecoverySweeper
-from workflow_engine.worker.worker import WorkflowWorker
+from workflow_engine.worker.worker import CancellationToken, WorkflowWorker
 
 
 def test_crash_injection_worker_death_recovery_and_stale_completion_rejection(
@@ -121,3 +121,51 @@ def test_worker_aborts_local_execution_on_lost_heartbeat(
 
     with pytest.raises((FencingTokenError, LeaseLostError)):
         worker.execute_one(slow_task_executor)
+
+
+def test_long_running_executor_observes_cooperative_cancellation_before_side_effects(
+    create_and_publish: Callable[[WorkflowDefinition], str],
+    run_repo: RunRepository,
+    two_node_workflow: WorkflowDefinition,
+) -> None:
+    wf_id = create_and_publish(two_node_workflow)
+    run_repo.create_run(wf_id, version=1)
+
+    worker = WorkflowWorker(
+        worker_id="worker-coop",
+        lease_duration_seconds=0.2,
+        heartbeat_interval_seconds=0.05,
+    )
+
+    step1_executed = False
+    step2_executed = False
+
+    def multistep_executor(
+        claimed_node: Any, cancellation_token: CancellationToken
+    ) -> dict[str, Any]:
+        nonlocal step1_executed, step2_executed
+
+        step1_executed = True
+
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE node_runs SET lease_generation = 888 WHERE id = %s;",
+                    (claimed_node.node_run_id,),
+                )
+            conn.commit()
+
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not cancellation_token.is_cancelled:
+            time.sleep(0.02)
+
+        cancellation_token.check_cancelled()
+
+        step2_executed = True
+        return {"step1": True, "step2": True}
+
+    with pytest.raises(LeaseLostError):
+        worker.execute_one(multistep_executor)
+
+    assert step1_executed is True
+    assert step2_executed is False

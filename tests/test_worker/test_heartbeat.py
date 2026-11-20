@@ -1,4 +1,5 @@
 import time
+from datetime import datetime
 from typing import Callable
 
 import pytest
@@ -102,3 +103,68 @@ def test_heartbeat_monitor_aborts_on_lease_loss(
     with pytest.raises(LeaseLostError):
         monitor.check_lease_validity()
     monitor.stop()
+
+
+def test_expired_heartbeat_rejected_and_never_resurrected(
+    create_and_publish: Callable[[WorkflowDefinition], str],
+    run_repo: RunRepository,
+    claim_engine: ClaimEngine,
+    heartbeat_service: HeartbeatService,
+    two_node_workflow: WorkflowDefinition,
+) -> None:
+    wf_id = create_and_publish(two_node_workflow)
+    run_repo.create_run(wf_id, version=1)
+
+    claimed = claim_engine.discover_and_claim_node(worker_id="worker-1", lease_seconds=10.0)
+    assert claimed is not None
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE node_runs
+                SET lease_expires_at = clock_timestamp() - INTERVAL '1 second'
+                WHERE id = %s;
+                """,
+                (claimed.node_run_id,),
+            )
+        conn.commit()
+
+    with pytest.raises(FencingTokenError):
+        heartbeat_service.send_heartbeat(claimed, extension_seconds=20.0)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status, lease_expires_at FROM node_runs WHERE id = %s;",
+                (claimed.node_run_id,),
+            )
+            row = cur.fetchone()
+            assert row is not None
+            assert row["status"] == "RUNNING"
+            assert row["lease_expires_at"] < datetime.now().astimezone()
+
+
+def test_heartbeat_rejected_when_parent_run_not_running(
+    create_and_publish: Callable[[WorkflowDefinition], str],
+    run_repo: RunRepository,
+    claim_engine: ClaimEngine,
+    heartbeat_service: HeartbeatService,
+    two_node_workflow: WorkflowDefinition,
+) -> None:
+    wf_id = create_and_publish(two_node_workflow)
+    run_id = run_repo.create_run(wf_id, version=1)
+
+    claimed = claim_engine.discover_and_claim_node(worker_id="worker-1", lease_seconds=10.0)
+    assert claimed is not None
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runs SET status = 'CANCELLED' WHERE id = %s;",
+                (run_id,),
+            )
+        conn.commit()
+
+    with pytest.raises(FencingTokenError):
+        heartbeat_service.send_heartbeat(claimed, extension_seconds=20.0)

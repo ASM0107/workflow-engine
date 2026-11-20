@@ -77,7 +77,29 @@ class LeaseRecoverySweeper:
             WHERE id = %s;
         """
 
-        query_cancel_remaining = """
+        query_cancel_running_siblings = """
+            WITH cancelled_nodes AS (
+                UPDATE node_runs
+                SET status = 'CANCELLED',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    lease_generation = lease_generation + 1,
+                    error = 'Cancelled due to sibling node failure',
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                  AND status = 'RUNNING'
+                  AND id != %s
+                RETURNING id
+            )
+            UPDATE node_attempts
+            SET status = 'CANCELLED',
+                error = 'Run failed fast due to sibling failure',
+                completed_at = clock_timestamp()
+            WHERE node_run_id IN (SELECT id FROM cancelled_nodes)
+              AND status = 'RUNNING';
+        """
+
+        query_cancel_pending_and_ready = """
             UPDATE node_runs
             SET status = 'CANCELLED',
                 lease_owner = NULL,
@@ -152,7 +174,8 @@ class LeaseRecoverySweeper:
                         else:
                             cur.execute(query_fail_node, (node_id,))
                             cur.execute(query_fail_run, (run_id,))
-                            cur.execute(query_cancel_remaining, (run_id,))
+                            cur.execute(query_cancel_running_siblings, (run_id, node_id))
+                            cur.execute(query_cancel_pending_and_ready, (run_id,))
 
                             event_id1 = uuid.uuid4().hex
                             cur.execute(
