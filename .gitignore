@@ -18,6 +18,14 @@ frontend/.vite/
 *.local
 
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
+*.swp
+*.bak
 .DS_Store
 Thumbs.db
 
