@@ -93,7 +93,10 @@ def test_heartbeat_monitor_aborts_on_lease_loss(
             )
         conn.commit()
 
-    time.sleep(0.15)
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not monitor.is_lease_lost:
+        time.sleep(0.02)
+
     assert monitor.is_lease_lost
     assert aborted
     with pytest.raises(LeaseLostError):
