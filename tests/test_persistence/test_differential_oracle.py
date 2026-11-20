@@ -48,12 +48,8 @@ def test_differential_agreement_on_multi_root_workflow(
             "e_alpha_agg": Edge(
                 id="e_alpha_agg", from_node_id="root_alpha", to_node_id="aggregator"
             ),
-            "e_beta_agg": Edge(
-                id="e_beta_agg", from_node_id="root_beta", to_node_id="aggregator"
-            ),
-            "e_agg_out": Edge(
-                id="e_agg_out", from_node_id="aggregator", to_node_id="output"
-            ),
+            "e_beta_agg": Edge(id="e_beta_agg", from_node_id="root_beta", to_node_id="aggregator"),
+            "e_agg_out": Edge(id="e_agg_out", from_node_id="aggregator", to_node_id="output"),
         },
     )
 

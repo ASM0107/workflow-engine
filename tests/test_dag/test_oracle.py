@@ -164,8 +164,8 @@ def test_oracle_deep_linear_chain() -> None:
         f"node_{i}": Node(id=f"node_{i}", type=NodeType.JSON_TRANSFORM) for i in range(chain_length)
     }
     edges = {
-        f"edge_{i}_{i+1}": Edge(
-            id=f"edge_{i}_{i+1}", from_node_id=f"node_{i}", to_node_id=f"node_{i+1}"
+        f"edge_{i}_{i + 1}": Edge(
+            id=f"edge_{i}_{i + 1}", from_node_id=f"node_{i}", to_node_id=f"node_{i + 1}"
         )
         for i in range(chain_length - 1)
     }

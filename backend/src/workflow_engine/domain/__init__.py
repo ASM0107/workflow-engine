@@ -1,4 +1,5 @@
 from workflow_engine.domain.entities import (
+    ClaimedNode,
     Edge,
     EdgeRunState,
     Node,
@@ -13,9 +14,12 @@ from workflow_engine.domain.errors import (
     DuplicateNodeError,
     DuplicateVersionError,
     EmptyWorkflowError,
+    FencingTokenError,
     InvalidEdgeStateTransitionError,
     InvalidNodeStateTransitionError,
     InvalidRunStateTransitionError,
+    LeaseLostError,
+    LockAcquisitionTimeout,
     RunNotFoundError,
     UnknownEdgeError,
     UnknownNodeError,
@@ -31,6 +35,7 @@ from workflow_engine.domain.types import (
 )
 
 __all__ = [
+    "ClaimedNode",
     "Edge",
     "EdgeRunState",
     "Node",
@@ -43,9 +48,12 @@ __all__ = [
     "DuplicateNodeError",
     "DuplicateVersionError",
     "EmptyWorkflowError",
+    "FencingTokenError",
     "InvalidEdgeStateTransitionError",
     "InvalidNodeStateTransitionError",
     "InvalidRunStateTransitionError",
+    "LeaseLostError",
+    "LockAcquisitionTimeout",
     "RunNotFoundError",
     "UnknownEdgeError",
     "UnknownNodeError",

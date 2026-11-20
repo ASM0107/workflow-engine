@@ -76,7 +76,7 @@ React + TypeScript Canvas UI (Planned M6)
 - **Normalized Schema (9 Tables)**: `workflows`, `workflow_versions`, `workflow_nodes`, `workflow_edges`, `runs`, `node_runs`, `edge_runs`, `node_attempts`, and `run_events`.
 - **Atomic Run Creation**: Creates the run in `QUEUED` status, initializes all node and edge runtime states, and promotes root nodes ($d_{in} = 0$) to `READY` within a single atomic database transaction.
 - **Partial & Scheduling Indexes**:
-  - `idx_runs_claimable`: `runs (last_claimed_at ASC NULLS FIRST, created_at ASC) WHERE status IN ('QUEUED', 'RUNNING')` for starvation-free round-robin worker discovery.
+  - `idx_runs_claimable`: `runs (last_claimed_at ASC NULLS FIRST, created_at ASC) WHERE status IN ('QUEUED', 'RUNNING')`, which, in conjunction with the candidate claiming protocol (`ORDER BY last_claimed_at ASC NULLS FIRST, created_at ASC FOR UPDATE SKIP LOCKED` and rotation timestamp updates), provides efficient, starvation-free round-robin run discovery.
   - `idx_node_runs_ready`: `node_runs (run_id, run_after) WHERE status = 'READY'` for instant ready node candidate queries.
   - `idx_node_runs_running_lease`: `node_runs (run_id, lease_expires_at) WHERE status = 'RUNNING'` for fast expired lease detection.
 - **Differential Oracle Agreement**: 100% agreement between database state transitions and the pure Python in-memory semantic reference oracle.
@@ -88,24 +88,24 @@ React + TypeScript Canvas UI (Planned M6)
 | Milestone | Scope | Status | Verification |
 |---|---|---|---|
 | **M0: Foundation** | Project scaffolding, tooling, uv venv, CI setup | **Completed** | Clean build & CI pipeline |
-| **M1: Pure In-Memory DAG Engine** | Graph validator, topological sorter, branch evaluator, skip propagation, in-memory reference oracle | **Completed** | 53 unit tests, 99% coverage |
+| **M1: Pure In-Memory DAG Engine** | Graph validator, topological sorter, branch evaluator, skip propagation, in-memory reference oracle | **Completed** | 54 unit tests, 99% coverage |
 | **M2: PostgreSQL Persistence** | Schema, Alembic migrations, partial indexes, atomic run creation, repositories | **Completed** | 69 integration tests, 98% coverage |
-| **M3: Worker Engine** | Run-first locking, fair candidate discovery, atomic claiming, fenced leases, heartbeats | *Awaiting Authorization* | Planned |
-| **M4: DAG Execution** | Distributed conditional branching, per-run edge state persistence, multi-hop DB skips | *Pending M3* | Planned |
+| **M3: Worker Engine** | Run-first locking, fair candidate discovery, atomic claiming, fenced leases, heartbeats, sweeper recovery | **Completed** | 87 integration & crash tests, 95% coverage |
+| **M4: DAG Execution** | Distributed conditional branching, per-run edge state persistence, multi-hop DB skips | *Awaiting Authorization* | Planned |
 | **M5: Resilience & Recovery** | Crash recovery sweeper, retry scheduling, exponential backoff, cancellation | *Pending M4* | Planned |
 | **M6: REST API & Canvas UI** | FastAPI routes, WebSockets execution stream, React canvas editor | *Pending M5* | Planned |
 | **M7: Deployment & Acceptance** | Docker Compose orchestration, comprehensive end-to-end integration, benchmarks | *Pending M6* | Planned |
 
 > [!IMPORTANT]
-> **Milestone Status Notice**: Milestones M0, M1, and M2 are fully implemented and verified. Milestone M3 (Worker Engine, distributed execution, fenced leases, and crash recovery) is currently designed and planned, but not yet implemented.
+> **Milestone Status Notice**: Milestones M0, M1, M2, and M3 are fully implemented and verified against real PostgreSQL 18. Milestone M4 (Full Database-Backed DAG Execution with distributed multi-hop skip propagation and reconvergent joins) is currently awaiting human authorization before implementation begins.
 
 ---
 
 ## 6. Known Limitations
 
-- **No Concurrent Worker Loop (M3 Planned)**: Node claiming and concurrent background worker execution loops are not yet implemented. Execution is currently verified through the repository layer and in-memory oracle.
+- **No Database Edge Cascading Yet (M4 Planned)**: Runtime node claiming, fenced execution, heartbeat monitoring, and recovery are complete. Edge state persistence and automated database-level multi-hop dead-path cascades are staged for M4.
 - **No External HTTP Execution (M4 Planned)**: Real external HTTP requests and payload transforms are staged for the worker execution phase.
-- **No Web UI / REST Endpoints (M6 Planned)**: Interaction is currently programmatically driven via the Python repository API and test suites.
+- **No Web UI / REST Endpoints (M6 Planned)**: Interaction is currently programmatically driven via the Python repository API, worker engines, and test suites.
 
 ---
 

@@ -1,4 +1,5 @@
 import time
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -54,3 +55,16 @@ class WorkflowRun(BaseModel):
     edge_states: dict[str, EdgeRunState] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
+
+
+class ClaimedNode(BaseModel):
+    run_id: str
+    node_run_id: str
+    node_key: str
+    node_type: NodeType
+    worker_id: str
+    lease_generation: int
+    lease_expires_at: datetime
+    attempt_number: int
+    config: dict[str, Any] = Field(default_factory=dict)
+    retry_limit: int = 0

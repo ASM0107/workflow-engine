@@ -74,3 +74,15 @@ class InvalidRunStateTransitionError(WorkflowEngineError):
         super().__init__(
             f"Illegal run state transition for '{run_id}': {current_state} -> {attempted_state}"
         )
+
+
+class FencingTokenError(WorkflowEngineError):
+    pass
+
+
+class LeaseLostError(WorkflowEngineError):
+    pass
+
+
+class LockAcquisitionTimeout(WorkflowEngineError):
+    pass

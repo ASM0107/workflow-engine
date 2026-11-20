@@ -168,12 +168,16 @@ class RunRepository:
             RETURNING id;
         """
         query_node_run = """
-            INSERT INTO node_runs (id, run_id, node_key, status, lease_generation)
-            VALUES (%s, %s, %s, %s, 0);
+            INSERT INTO node_runs (
+                id, run_id, workflow_version_id, node_key, status, lease_generation
+            )
+            VALUES (%s, %s, %s, %s, %s, 0);
         """
         query_edge_run = """
-            INSERT INTO edge_runs (id, run_id, edge_key, from_node_key, to_node_key, status)
-            VALUES (%s, %s, %s, %s, %s, 'PENDING');
+            INSERT INTO edge_runs (
+                id, run_id, workflow_version_id, edge_key, from_node_key, to_node_key, status
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, 'PENDING');
         """
         query_event = """
             INSERT INTO run_events (id, run_id, event_type, payload)
@@ -190,7 +194,13 @@ class RunRepository:
                         node_run_id = uuid.uuid4().hex
                         cur.execute(
                             query_node_run,
-                            (node_run_id, assigned_run_id, node_key, initial_status),
+                            (
+                                node_run_id,
+                                assigned_run_id,
+                                workflow_version_id,
+                                node_key,
+                                initial_status,
+                            ),
                         )
 
                     for edge_key, edge in definition.edges.items():
@@ -200,6 +210,7 @@ class RunRepository:
                             (
                                 edge_run_id,
                                 assigned_run_id,
+                                workflow_version_id,
                                 edge_key,
                                 edge.from_node_id,
                                 edge.to_node_id,

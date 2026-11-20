@@ -40,9 +40,7 @@ def test_condition_node_evaluates_named_branch() -> None:
     node = Node(id="cond", type=NodeType.CONDITION)
     edges = [
         Edge(id="e_low", from_node_id="cond", to_node_id="low", condition_match="low_priority"),
-        Edge(
-            id="e_high", from_node_id="cond", to_node_id="high", condition_match="high_priority"
-        ),
+        Edge(id="e_high", from_node_id="cond", to_node_id="high", condition_match="high_priority"),
         Edge(id="e_crit", from_node_id="cond", to_node_id="crit", condition_match="critical"),
     ]
     result = evaluate_outgoing_edges(node, edges, output={"branch": "high_priority"})

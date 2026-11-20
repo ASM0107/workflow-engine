@@ -70,7 +70,6 @@ def test_invalid_workflow_rejected_before_db_insertion(
         workflow_repo.publish_version(wf_id, 1, cyclic_def)
 
 
-
 def test_repository_get_methods_and_not_found_errors(
     workflow_repo: WorkflowRepository,
     sample_definition: WorkflowDefinition,

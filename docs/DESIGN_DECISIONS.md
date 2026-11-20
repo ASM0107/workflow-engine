@@ -71,3 +71,27 @@
   - Index size remains bounded proportional to active workload, not cumulative history.
   - Query plans consistently utilize index scans even across high-volume terminal history.
 
+## ADR-008: Workflow Deletion and Execution History Retention Policy
+- **Context**: Modifying or deleting workflows must not corrupt historical audit trails, invalidate telemetry, or create dangling foreign keys.
+- **Decision**:
+  1. **Strict Immutability with RESTRICT Constraints**: Foreign key from `runs` to `workflow_versions` uses `ON DELETE RESTRICT`. A published version referenced by any execution run cannot be dropped or deleted.
+  2. **Soft Deletion for Workflow Lifecycle**: Workflows can be archived/deactivated, which hides them from active authoring without touching database definitions or historical records.
+  3. **Hard Deletion Exclusively for Unreferenced Drafts**: A workflow and its versions can only be hard-deleted if zero associated `runs` exist.
+  4. **Targeted Execution Purge Procedures**: When pruning stale telemetry for compliance or storage retention (e.g. runs older than 90 days), batch purges operate exclusively on terminal `runs` (`status IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`). Cascade rules on `node_runs`, `edge_runs`, `node_attempts`, and `run_events` cleanly purge child records while preserving the underlying `workflow_versions`.
+- **Consequences**:
+  - Guarantees strict non-repudiation and auditable historical execution records.
+  - Prevents inadvertent catastrophic cascading deletion of production execution data.
+
+## ADR-009: Monotonically Fenced Leases and Hierarchical Row Locking
+- **Context**: Distributed workers executing nodes must handle transient worker crashes, network partitions, and stale completions without split-brain corruption or deadlocks.
+- **Decision**:
+  1. **Strict Hierarchical Locking**: Every database transaction touching run execution acquires `runs` row lock via `FOR UPDATE` before accessing `node_runs` or `edge_runs`.
+  2. **Monotonic Lease Generation**: Each claim, recovery, or retry increments a 64-bit integer `lease_generation`.
+  3. **Fenced Updates**: Heartbeat extensions, successes, and failures include `WHERE lease_owner = $worker AND lease_generation = $gen AND status = 'RUNNING'`.
+  4. **Active Abort via Heartbeat Monitor**: Workers spawn a background heartbeat monitor that aborts local processing if lease ownership is lost.
+- **Consequences**:
+  - Complete elimination of database deadlocks between concurrent workers.
+  - Guaranteed immunity against split-brain execution or zombie worker state overwrite.
+
+
+
