@@ -44,6 +44,10 @@ class SSRFRedirectServerHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header("Location", "/api/../admin")
             self.end_headers()
+        elif self.path == "/redirect_encoded_slash":
+            self.send_response(302)
+            self.send_header("Location", "/api/%2f..%2f..%2fadmin")
+            self.end_headers()
         elif self.path in ("/api", "/api/", "/api/v1/users"):
             self.send_response(200)
             self.end_headers()
@@ -387,6 +391,11 @@ def test_path_allowlist_segment_boundary_matching(ssrf_server: str) -> None:
         "/api/%2E%2E/admin",
         "/api/%252e%252e/admin",
         "/api/%255cadmin",
+        "/api/%2f..%2f..%2fadmin",
+        "/api/%2F..%2F..%2Fadmin",
+        "/api/%2fadmin",
+        "/api/%2Fadmin",
+        "/api/v1%2fusers",
     ],
 )
 def test_path_allowlist_traversal_rejections(ssrf_server: str, traversal_path: str) -> None:
@@ -423,6 +432,27 @@ def test_redirect_path_traversal_rejected(ssrf_server: str) -> None:
         node_key="redir_trav_node",
         node_type=NodeType.HTTP,
         config={"url": f"{ssrf_server}/redirect_traversal", "method": "GET"},
+        inputs={},
+        cancellation_token=token,
+    )
+
+    with pytest.raises(AllowlistViolationError):
+        executor.execute(context)
+
+
+def test_redirect_encoded_slash_traversal_rejected(ssrf_server: str) -> None:
+    policy = HttpSecurityPolicy(
+        allowed_origins=[ssrf_server],
+        allowed_path_prefixes=["/api"],
+        allow_loopback_for_testing=True,
+    )
+    executor = HttpNodeExecutor(policy)
+    token = CancellationToken()
+    context = ExecutionContext(
+        run_id="run-redir-slash",
+        node_key="redir_slash_node",
+        node_type=NodeType.HTTP,
+        config={"url": f"{ssrf_server}/redirect_encoded_slash", "method": "GET"},
         inputs={},
         cancellation_token=token,
     )

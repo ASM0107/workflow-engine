@@ -1,7 +1,9 @@
 import http.client
+import io
 import ipaddress
 import json
 import math
+import posixpath
 import select
 import socket
 import ssl
@@ -53,9 +55,11 @@ SENSITIVE_HEADERS = frozenset(
 def _resolve_bounded_timeout(val: Any, ceiling: float, name: str) -> float:
     if val is None:
         return ceiling
+    if isinstance(val, bool):
+        raise PermanentExecutionError(f"{name} cannot be a boolean")
     try:
         timeout = float(val)
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, OverflowError) as exc:
         raise PermanentExecutionError(
             f"Invalid {name} '{val}': must be a finite positive number"
         ) from exc
@@ -67,9 +71,16 @@ def _resolve_bounded_timeout(val: Any, ceiling: float, name: str) -> float:
 def _resolve_bounded_max_bytes(val: Any, ceiling: int) -> int:
     if val is None:
         return ceiling
+    if isinstance(val, bool):
+        raise PermanentExecutionError("max_response_bytes cannot be a boolean")
+    if isinstance(val, float):
+        raise PermanentExecutionError("max_response_bytes must be an integer, not a float")
     try:
+        if isinstance(val, str):
+            if "." in val or "e" in val.lower():
+                raise PermanentExecutionError(f"max_response_bytes must be an integer, got '{val}'")
         bytes_val = int(val)
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, OverflowError) as exc:
         raise PermanentExecutionError(
             f"Invalid max_response_bytes '{val}': must be a positive integer"
         ) from exc
@@ -98,6 +109,72 @@ def _wait_for_readable(
         rlist, _, _ = select.select([sock], [], [], wait_time)
         if rlist:
             return
+
+
+def _read_headers_cancellation_aware(
+    sock: socket.socket,
+    timeout: float,
+    token: CancellationToken,
+    slice_interval: float = 0.05,
+) -> bytes:
+    buffer = bytearray()
+    start_time = time.monotonic()
+    while True:
+        token.check_cancelled()
+        elapsed = time.monotonic() - start_time
+        remaining = timeout - elapsed
+        if remaining <= 0:
+            raise TimeoutExecutionError("HTTP timeout waiting for response headers")
+
+        if isinstance(sock, ssl.SSLSocket) and sock.pending() > 0:
+            can_read = True
+        else:
+            wait_time = min(slice_interval, remaining)
+            rlist, _, _ = select.select([sock], [], [], wait_time)
+            can_read = bool(rlist)
+
+        if can_read:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            if b"\r\n\r\n" in buffer or b"\n\n" in buffer:
+                break
+
+    token.check_cancelled()
+    return bytes(buffer)
+
+
+class CancellableHTTPResponse(http.client.HTTPResponse):
+    def __init__(
+        self,
+        sock: socket.socket,
+        prefetched_data: bytes,
+        method: str | None = None,
+    ) -> None:
+        super().__init__(sock, method=method)
+        underlying = self.fp
+        buf = io.BytesIO(prefetched_data)
+        self.buffered_io = buf
+        self.prefetched_length = len(prefetched_data)
+
+        class ChainedStream(io.RawIOBase):
+            def readable(self) -> bool:
+                return True
+
+            def readinto(self, b: Any) -> int:
+                n = buf.readinto(b)
+                if n > 0:
+                    return int(n)
+                return int(underlying.readinto(b))
+
+            def close(self) -> None:
+                underlying.close()
+
+        self.fp = io.BufferedReader(ChainedStream())
+
+    def has_buffered_data(self) -> bool:
+        return self.buffered_io.tell() < self.prefetched_length
 
 
 class DirectIPHTTPConnection(http.client.HTTPConnection):
@@ -286,16 +363,30 @@ class HttpNodeExecutor:
                 )
 
             try:
+                context.cancellation_token.check_cancelled()
                 conn.connect()
+                context.cancellation_token.check_cancelled()
+
                 conn.request(
                     method=current_method,
                     url=request_path,
                     body=current_body if current_method not in ("GET", "HEAD") else None,
                     headers=req_headers,
                 )
-                if conn.sock is not None:
-                    _wait_for_readable(conn.sock, read_timeout, context.cancellation_token)
-                response = conn.getresponse()
+                context.cancellation_token.check_cancelled()
+
+                if conn.sock is None:
+                    raise RetryableExecutionError("Socket connection not available")
+
+                prefetched = _read_headers_cancellation_aware(
+                    conn.sock, read_timeout, context.cancellation_token
+                )
+                context.cancellation_token.check_cancelled()
+
+                response = CancellableHTTPResponse(
+                    conn.sock, prefetched_data=prefetched, method=current_method
+                )
+                response.begin()
 
                 if response.status in (301, 302, 303, 307, 308):
                     location = response.getheader("Location")
@@ -440,18 +531,43 @@ class HttpNodeExecutor:
             raise AllowlistViolationError(f"Encoded backslash rejected: '{raw_path}'")
         if "%2e" in lower_path:
             raise AllowlistViolationError(f"Encoded dot rejected: '{raw_path}'")
+        if "%2f" in lower_path:
+            raise AllowlistViolationError(f"Encoded forward slash rejected: '{raw_path}'")
 
-        segments = raw_path.split("/")
-        if ".." in segments or "." in segments:
+        raw_segments = raw_path.split("/")
+        if ".." in raw_segments or "." in raw_segments:
             raise AllowlistViolationError(f"Dot segment path traversal rejected: '{raw_path}'")
 
-        matched = any(
+        unquoted_path = urllib.parse.unquote(raw_path)
+        if "\\" in unquoted_path:
+            raise AllowlistViolationError(f"Unquoted backslash rejected: '{unquoted_path}'")
+
+        unquoted_segments = unquoted_path.split("/")
+        if ".." in unquoted_segments or "." in unquoted_segments:
+            raise AllowlistViolationError(
+                f"Unquoted traversal dot segment rejected: '{unquoted_path}'"
+            )
+
+        canonical_path = posixpath.normpath(unquoted_path)
+        if canonical_path == ".." or canonical_path.startswith("../") or "/../" in canonical_path:
+            raise AllowlistViolationError(f"Canonical path traversal rejected: '{canonical_path}'")
+
+        matched_raw = any(
             self._matches_path_prefix(raw_path, prefix)
             for prefix in self.policy.allowed_path_prefixes
         )
-        if not matched:
+        if not matched_raw:
             raise AllowlistViolationError(
                 f"URL path '{raw_path}' does not match allowed path prefixes"
+            )
+
+        matched_canonical = any(
+            self._matches_path_prefix(canonical_path, prefix)
+            for prefix in self.policy.allowed_path_prefixes
+        )
+        if not matched_canonical:
+            raise AllowlistViolationError(
+                f"Canonical URL path '{canonical_path}' does not match allowed path prefixes"
             )
 
     @staticmethod
@@ -527,7 +643,7 @@ class HttpNodeExecutor:
 
     def _read_bounded_response(
         self,
-        response: http.client.HTTPResponse,
+        response: CancellableHTTPResponse,
         sock: socket.socket | None,
         max_bytes: int,
         read_timeout: float,
@@ -550,7 +666,7 @@ class HttpNodeExecutor:
         chunk_size = 65536
         while True:
             context.cancellation_token.check_cancelled()
-            if sock is not None:
+            if sock is not None and not response.has_buffered_data():
                 _wait_for_readable(sock, read_timeout, context.cancellation_token)
             chunk = response.read1(chunk_size)
             if not chunk:

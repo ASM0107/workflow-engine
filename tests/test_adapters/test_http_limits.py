@@ -46,6 +46,11 @@ class LimitsServerHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"tick\n")
                 self.wfile.flush()
                 time.sleep(0.1)
+        elif self.path == "/partial_headers":
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Incomplete: true\r\n")
+            self.wfile.flush()
+            time.sleep(2.0)
+            self.wfile.write(b"\r\n")
         elif self.path == "/redirect_loop":
             self.send_response(302)
             self.send_header("Location", "/redirect_loop")
@@ -186,16 +191,27 @@ def test_per_node_max_bytes_clamped_to_policy_ceiling(limits_server: str) -> Non
 @pytest.mark.parametrize(
     ("bad_field", "bad_value"),
     [
+        ("max_response_bytes", True),
+        ("max_response_bytes", False),
+        ("max_response_bytes", 12.5),
+        ("max_response_bytes", "12.5"),
+        ("max_response_bytes", "1e5"),
+        ("max_response_bytes", float("inf")),
+        ("max_response_bytes", float("nan")),
+        ("max_response_bytes", 0),
+        ("max_response_bytes", -10),
+        ("read_timeout", True),
+        ("read_timeout", False),
         ("read_timeout", -1.0),
         ("read_timeout", 0.0),
         ("read_timeout", float("nan")),
         ("read_timeout", float("inf")),
+        ("connect_timeout", True),
+        ("connect_timeout", False),
         ("connect_timeout", -5.0),
         ("connect_timeout", 0.0),
         ("connect_timeout", float("nan")),
         ("connect_timeout", float("inf")),
-        ("max_response_bytes", 0),
-        ("max_response_bytes", -100),
     ],
 )
 def test_invalid_resource_limits_raise_permanent_error(
@@ -222,6 +238,51 @@ def test_invalid_resource_limits_raise_permanent_error(
 
     with pytest.raises(PermanentExecutionError):
         executor.execute(context)
+
+
+def test_in_flight_cancellation_during_partial_response_headers(limits_server: str) -> None:
+    policy = HttpSecurityPolicy(
+        allowed_origins=[limits_server],
+        allow_loopback_for_testing=True,
+        read_timeout_seconds=5.0,
+    )
+    executor = HttpNodeExecutor(policy)
+    token = CancellationToken()
+
+    context = ExecutionContext(
+        run_id="run-partial-cancel",
+        node_key="partial_cancel_node",
+        node_type=NodeType.HTTP,
+        config={"url": f"{limits_server}/partial_headers", "method": "GET"},
+        inputs={},
+        cancellation_token=token,
+    )
+
+    raised_error: list[Exception] = []
+    cancel_time: list[float] = []
+    abort_time: list[float] = []
+
+    def execute_worker() -> None:
+        try:
+            executor.execute(context)
+        except Exception as exc:
+            abort_time.append(time.monotonic())
+            raised_error.append(exc)
+
+    thread = threading.Thread(target=execute_worker)
+    thread.start()
+
+    time.sleep(0.05)
+    cancel_time.append(time.monotonic())
+    token.cancel()
+
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+    assert len(raised_error) == 1
+    assert isinstance(raised_error[0], LeaseLostError)
+
+    elapsed_after_cancel = abort_time[0] - cancel_time[0]
+    assert elapsed_after_cancel <= 0.15
 
 
 def test_in_flight_cancellation_aborts_slow_request_within_interval(limits_server: str) -> None:
