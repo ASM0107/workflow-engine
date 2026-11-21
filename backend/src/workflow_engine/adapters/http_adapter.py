@@ -1,15 +1,21 @@
 import http.client
 import ipaddress
 import json
+import math
+import select
 import socket
 import ssl
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
 from workflow_engine.adapters.base import ExecutionContext, ExecutionResult
+from workflow_engine.adapters.transform_adapter import SafeTemplateEngine
+from workflow_engine.domain.cancellation import CancellationToken
 from workflow_engine.domain.errors import (
     AllowlistViolationError,
+    LeaseLostError,
     PermanentExecutionError,
     ResponseSizeLimitExceededError,
     RetryableExecutionError,
@@ -17,14 +23,81 @@ from workflow_engine.domain.errors import (
     TimeoutExecutionError,
 )
 
+SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
+ALIBABA_METADATA_IP = "100.100.100.200"
+METADATA_IPS = frozenset(["169.254.169.254", "100.100.100.200", "fd00:ec2::254"])
 METADATA_HOSTNAMES = frozenset(
     [
         "metadata.google.internal",
         "instance-data",
         "169.254.169.254",
+        "100.100.100.200",
         "fd00:ec2::254",
     ]
 )
+SENSITIVE_HEADERS = frozenset(
+    [
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+        "token",
+        "secret",
+    ]
+)
+
+
+def _resolve_bounded_timeout(val: Any, ceiling: float, name: str) -> float:
+    if val is None:
+        return ceiling
+    try:
+        timeout = float(val)
+    except (ValueError, TypeError) as exc:
+        raise PermanentExecutionError(
+            f"Invalid {name} '{val}': must be a finite positive number"
+        ) from exc
+    if math.isnan(timeout) or math.isinf(timeout) or timeout <= 0:
+        raise PermanentExecutionError(f"{name} must be a positive finite number, got {val}")
+    return min(timeout, ceiling)
+
+
+def _resolve_bounded_max_bytes(val: Any, ceiling: int) -> int:
+    if val is None:
+        return ceiling
+    try:
+        bytes_val = int(val)
+    except (ValueError, TypeError) as exc:
+        raise PermanentExecutionError(
+            f"Invalid max_response_bytes '{val}': must be a positive integer"
+        ) from exc
+    if bytes_val <= 0:
+        raise PermanentExecutionError(f"max_response_bytes must be positive, got {bytes_val}")
+    return min(bytes_val, ceiling)
+
+
+def _wait_for_readable(
+    sock: socket.socket,
+    timeout: float,
+    token: CancellationToken,
+    slice_interval: float = 0.05,
+) -> None:
+    start_time = time.monotonic()
+    while True:
+        token.check_cancelled()
+        if isinstance(sock, ssl.SSLSocket):
+            if sock.pending() > 0:
+                return
+        elapsed = time.monotonic() - start_time
+        remaining = timeout - elapsed
+        if remaining <= 0:
+            raise TimeoutExecutionError("HTTP socket read timed out")
+        wait_time = min(slice_interval, remaining)
+        rlist, _, _ = select.select([sock], [], [], wait_time)
+        if rlist:
+            return
 
 
 class DirectIPHTTPConnection(http.client.HTTPConnection):
@@ -97,20 +170,55 @@ class HttpNodeExecutor:
         if not raw_url:
             raise PermanentExecutionError("Missing 'url' in HTTP node configuration")
 
+        eval_data = self._build_evaluation_data(context)
+        rendered_url = str(SafeTemplateEngine.render_template(str(raw_url), eval_data))
+
         method = str(config.get("method", "GET")).upper()
         if method not in ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"):
             raise PermanentExecutionError(f"Unsupported HTTP method: '{method}'")
 
-        headers = {str(k): str(v) for k, v in config.get("headers", {}).items()}
-        params = config.get("params")
-        current_url = self._build_initial_url(raw_url, params)
+        raw_headers = config.get("headers", {})
+        rendered_headers = SafeTemplateEngine.render_data_structure(raw_headers, eval_data)
+        if not isinstance(rendered_headers, dict):
+            rendered_headers = {}
+        headers = {str(k): str(v) for k, v in rendered_headers.items()}
 
-        body_bytes = self._prepare_body(config, headers)
+        raw_params = config.get("params")
+        rendered_params = (
+            SafeTemplateEngine.render_data_structure(raw_params, eval_data)
+            if raw_params is not None
+            else None
+        )
+        current_url = self._build_initial_url(rendered_url, rendered_params)
+
+        rendered_config = dict(config)
+        if "json" in config:
+            rendered_config["json"] = SafeTemplateEngine.render_data_structure(
+                config["json"], eval_data
+            )
+        if "data" in config or "body" in config:
+            data_key = "data" if "data" in config else "body"
+            rendered_config[data_key] = SafeTemplateEngine.render_data_structure(
+                config[data_key], eval_data
+            )
+
+        body_bytes = self._prepare_body(rendered_config, headers)
 
         policy = self.policy
-        connect_timeout = float(config.get("connect_timeout", policy.connect_timeout_seconds))
-        read_timeout = float(config.get("read_timeout", policy.read_timeout_seconds))
-        max_bytes = int(config.get("max_response_bytes", policy.max_response_bytes))
+        connect_timeout = _resolve_bounded_timeout(
+            config.get("connect_timeout"),
+            policy.connect_timeout_seconds,
+            "connect_timeout",
+        )
+        read_timeout = _resolve_bounded_timeout(
+            config.get("read_timeout"),
+            policy.read_timeout_seconds,
+            "read_timeout",
+        )
+        max_bytes = _resolve_bounded_max_bytes(
+            config.get("max_response_bytes"),
+            policy.max_response_bytes,
+        )
         fail_on_error = bool(config.get("fail_on_error_status", True))
 
         redirects_remaining = policy.max_redirects
@@ -151,8 +259,9 @@ class HttpNodeExecutor:
             req_headers.setdefault("Host", hostname if port in (80, 443) else f"{hostname}:{port}")
 
             if initial_origin and origin != initial_origin:
-                req_headers.pop("Authorization", None)
-                req_headers.pop("authorization", None)
+                req_headers = {
+                    k: v for k, v in req_headers.items() if k.lower() not in SENSITIVE_HEADERS
+                }
 
             context.cancellation_token.check_cancelled()
 
@@ -184,6 +293,8 @@ class HttpNodeExecutor:
                     body=current_body if current_method not in ("GET", "HEAD") else None,
                     headers=req_headers,
                 )
+                if conn.sock is not None:
+                    _wait_for_readable(conn.sock, read_timeout, context.cancellation_token)
                 response = conn.getresponse()
 
                 if response.status in (301, 302, 303, 307, 308):
@@ -205,7 +316,9 @@ class HttpNodeExecutor:
 
                 response_headers = {k.lower(): v for k, v in response.getheaders()}
 
-                raw_bytes = self._read_bounded_response(response, max_bytes, context)
+                raw_bytes = self._read_bounded_response(
+                    response, conn.sock, max_bytes, read_timeout, context
+                )
                 conn.close()
 
                 text_content = raw_bytes.decode("utf-8", errors="replace")
@@ -232,6 +345,9 @@ class HttpNodeExecutor:
                     }
                 )
 
+            except LeaseLostError:
+                conn.close()
+                raise
             except (socket.timeout, TimeoutError) as exc:
                 conn.close()
                 raise TimeoutExecutionError(f"HTTP request timed out: {exc}") from exc
@@ -250,6 +366,16 @@ class HttpNodeExecutor:
             except Exception as exc:
                 conn.close()
                 raise RetryableExecutionError(f"HTTP execution error: {exc}") from exc
+
+    def _build_evaluation_data(self, context: ExecutionContext) -> dict[str, Any]:
+        inputs = context.inputs
+        steps = inputs.get("steps") if isinstance(inputs.get("steps"), dict) else inputs
+        return {
+            "steps": steps,
+            "inputs": inputs,
+            "config": context.config,
+            **inputs,
+        }
 
     def _build_initial_url(self, raw_url: str, params: Any) -> str:
         if not params or not isinstance(params, dict):
@@ -287,10 +413,11 @@ class HttpNodeExecutor:
     def _extract_origin(self, parsed: urllib.parse.SplitResult) -> str:
         scheme = parsed.scheme.lower()
         hostname = (parsed.hostname or "").lower()
+        net_host = f"[{hostname}]" if ":" in hostname else hostname
         port = parsed.port
         if port is None or (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
-            return f"{scheme}://{hostname}"
-        return f"{scheme}://{hostname}:{port}"
+            return f"{scheme}://{net_host}"
+        return f"{scheme}://{net_host}:{port}"
 
     def _validate_origin_and_path(self, parsed: urllib.parse.SplitResult, origin: str) -> None:
         allowed = [o.lower().rstrip("/") for o in self.policy.allowed_origins]
@@ -301,10 +428,38 @@ class HttpNodeExecutor:
         if origin not in allowed:
             raise AllowlistViolationError(f"URL origin '{origin}' is not in configured allowlist")
 
-        path = parsed.path or "/"
-        matched_path = any(path.startswith(prefix) for prefix in self.policy.allowed_path_prefixes)
-        if not matched_path:
-            raise AllowlistViolationError(f"URL path '{path}' does not match allowed path prefixes")
+        raw_path = parsed.path or "/"
+
+        if "\\" in raw_path:
+            raise AllowlistViolationError(f"Backslash path traversal rejected: '{raw_path}'")
+
+        lower_path = raw_path.lower()
+        if "%25" in lower_path:
+            raise AllowlistViolationError(f"Double encoding rejected: '{raw_path}'")
+        if "%5c" in lower_path:
+            raise AllowlistViolationError(f"Encoded backslash rejected: '{raw_path}'")
+        if "%2e" in lower_path:
+            raise AllowlistViolationError(f"Encoded dot rejected: '{raw_path}'")
+
+        segments = raw_path.split("/")
+        if ".." in segments or "." in segments:
+            raise AllowlistViolationError(f"Dot segment path traversal rejected: '{raw_path}'")
+
+        matched = any(
+            self._matches_path_prefix(raw_path, prefix)
+            for prefix in self.policy.allowed_path_prefixes
+        )
+        if not matched:
+            raise AllowlistViolationError(
+                f"URL path '{raw_path}' does not match allowed path prefixes"
+            )
+
+    @staticmethod
+    def _matches_path_prefix(path: str, prefix: str) -> bool:
+        if prefix in ("/", ""):
+            return path.startswith("/")
+        clean_prefix = prefix.rstrip("/")
+        return path == clean_prefix or path.startswith(clean_prefix + "/")
 
     def _validate_and_resolve_destination(
         self, hostname: str, port: int, allow_loopback: bool
@@ -348,8 +503,18 @@ class HttpNodeExecutor:
         if allow_loopback and ip.is_loopback:
             return
 
+        ip_str = str(ip)
+        if ip_str in METADATA_IPS:
+            raise SSRFSecurityError(f"Access to cloud metadata IP '{ip_str}' is prohibited")
+
+        if isinstance(ip, ipaddress.IPv4Address) and ip in SHARED_ADDRESS_SPACE:
+            raise SSRFSecurityError(
+                f"Access to shared address space IP '{ip_str}' is blocked by SSRF policy"
+            )
+
         if (
-            ip.is_loopback
+            not ip.is_global
+            or ip.is_loopback
             or ip.is_private
             or ip.is_link_local
             or ip.is_reserved
@@ -360,14 +525,12 @@ class HttpNodeExecutor:
                 f"Access to IP address '{ip}' is blocked by SSRF security policy"
             )
 
-        ip_str = str(ip)
-        if ip_str in ("169.254.169.254", "fd00:ec2::254"):
-            raise SSRFSecurityError(f"Access to cloud metadata IP '{ip_str}' is prohibited")
-
     def _read_bounded_response(
         self,
         response: http.client.HTTPResponse,
+        sock: socket.socket | None,
         max_bytes: int,
+        read_timeout: float,
         context: ExecutionContext,
     ) -> bytes:
         content_length_str = response.getheader("Content-Length")
@@ -378,6 +541,8 @@ class HttpNodeExecutor:
                     raise ResponseSizeLimitExceededError(
                         f"Response Content-Length {content_length} exceeds limit {max_bytes}"
                     )
+                if content_length == 0:
+                    return b""
             except ValueError:
                 pass
 
@@ -385,7 +550,9 @@ class HttpNodeExecutor:
         chunk_size = 65536
         while True:
             context.cancellation_token.check_cancelled()
-            chunk = response.read(chunk_size)
+            if sock is not None:
+                _wait_for_readable(sock, read_timeout, context.cancellation_token)
+            chunk = response.read1(chunk_size)
             if not chunk:
                 break
             buffer.extend(chunk)

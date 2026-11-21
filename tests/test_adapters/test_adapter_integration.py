@@ -40,6 +40,19 @@ class IntegrationMockServerHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": "not found"})
 
+    def do_POST(self) -> None:
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        parsed_body = json.loads(body.decode("utf-8")) if body else {}
+        self._send_json(
+            201,
+            {
+                "received_path": self.path,
+                "received_body": parsed_body,
+                "received_role": self.headers.get("X-Role"),
+            },
+        )
+
     def _send_json(self, status: int, data: dict[str, Any]) -> None:
         payload = json.dumps(data).encode("utf-8")
         self.send_response(status)
@@ -146,6 +159,95 @@ def test_end_to_end_workflow_with_native_adapters(
 
     assert nodes["check_admin"]["status"] == "SUCCEEDED"
     assert nodes["check_admin"]["output"]["result"] is True
+
+
+def test_end_to_end_trigger_transform_http_post(
+    create_and_publish: Callable[[WorkflowDefinition], str],
+    run_repo: RunRepository,
+    integration_server: str,
+) -> None:
+    policy = HttpSecurityPolicy(
+        allowed_origins=[integration_server],
+        allow_loopback_for_testing=True,
+    )
+    registry = create_default_registry(http_policy=policy)
+
+    definition = WorkflowDefinition(
+        id="wf_e2e_trigger_transform_post",
+        version=1,
+        nodes={
+            "trigger": Node(
+                id="trigger",
+                type=NodeType.MANUAL_TRIGGER,
+                config={"initial_data": {"user_id": 99, "action": "promote", "role": "admin"}},
+            ),
+            "transform": Node(
+                id="transform",
+                type=NodeType.JSON_TRANSFORM,
+                config={
+                    "mapping": {
+                        "account_id": "{{ steps.trigger.user_id }}",
+                        "new_role": "{{ steps.trigger.role }}",
+                        "meta": {"operation": "{{ steps.trigger.action }}"},
+                    }
+                },
+            ),
+            "post_action": Node(
+                id="post_action",
+                type=NodeType.HTTP,
+                config={
+                    "url": (
+                        f"{integration_server}/api/accounts/"
+                        "{{ steps.transform.result.account_id }}"
+                    ),
+                    "method": "POST",
+                    "headers": {
+                        "X-Role": "{{ steps.transform.result.new_role }}",
+                    },
+                    "json": {
+                        "account_id": "{{ steps.transform.result.account_id }}",
+                        "role": "{{ steps.transform.result.new_role }}",
+                        "operation": "{{ steps.transform.result.meta.operation }}",
+                    },
+                },
+            ),
+        },
+        edges={
+            "e_trigger_transform": Edge(
+                id="e_trigger_transform", from_node_id="trigger", to_node_id="transform"
+            ),
+            "e_transform_post": Edge(
+                id="e_transform_post", from_node_id="transform", to_node_id="post_action"
+            ),
+        },
+    )
+
+    wf_id = create_and_publish(definition)
+    run_id = run_repo.create_run(wf_id, 1)
+
+    worker = WorkflowWorker(worker_id="e2e-post-worker", registry=registry)
+    for _ in range(10):
+        claimed = worker.execute_one()
+        if not claimed:
+            break
+
+    run = run_repo.get_run(run_id)
+    assert run["status"] == "SUCCEEDED"
+
+    nodes = run_repo.get_node_runs(run_id)
+    assert nodes["trigger"]["status"] == "SUCCEEDED"
+    assert nodes["transform"]["status"] == "SUCCEEDED"
+    assert nodes["post_action"]["status"] == "SUCCEEDED"
+
+    post_output = nodes["post_action"]["output"]
+    assert post_output["status_code"] == 201
+    assert post_output["body"]["received_path"] == "/api/accounts/99"
+    assert post_output["body"]["received_role"] == "admin"
+    assert post_output["body"]["received_body"] == {
+        "account_id": 99,
+        "role": "admin",
+        "operation": "promote",
+    }
 
 
 def test_permanent_ssrf_failure_aborts_without_retrying(

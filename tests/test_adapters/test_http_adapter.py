@@ -31,6 +31,9 @@ class MockServerHandler(http.server.BaseHTTPRequestHandler):
         elif parsed.path == "/target":
             auth_hdr = self.headers.get("Authorization")
             self._send_json(200, {"reached": True, "auth": auth_hdr})
+        elif parsed.path == "/echo_headers":
+            headers_dict = {k.lower(): v for k, v in self.headers.items()}
+            self._send_json(200, {"headers": headers_dict})
         elif parsed.path == "/error_400":
             self._send_json(400, {"error": "bad request"})
         elif parsed.path == "/error_500":
@@ -77,6 +80,17 @@ class MockServerHandler(http.server.BaseHTTPRequestHandler):
 
 @pytest.fixture
 def mock_server() -> Generator[tuple[str, int], None, None]:
+    server = http.server.HTTPServer(("127.0.0.1", 0), MockServerHandler)
+    port = int(server.server_address[1])
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    yield f"http://127.0.0.1:{port}", port
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.fixture
+def secondary_server() -> Generator[tuple[str, int], None, None]:
     server = http.server.HTTPServer(("127.0.0.1", 0), MockServerHandler)
     port = int(server.server_address[1])
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -214,6 +228,126 @@ def test_http_redirect_handled_correctly(mock_server: tuple[str, int]) -> None:
     result = executor.execute(context)
     assert result.output["status_code"] == 200
     assert result.output["body"]["reached"] is True
+
+
+def test_cross_origin_redirect_strips_sensitive_headers_case_insensitively(
+    mock_server: tuple[str, int],
+    secondary_server: tuple[str, int],
+) -> None:
+    origin_a, _ = mock_server
+    origin_b, _ = secondary_server
+
+    class CrossOriginRedirectHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            if self.path == "/redirect_to_b":
+                self.send_response(302)
+                self.send_header("Location", f"{origin_b}/echo_headers")
+                self.end_headers()
+
+    server_a = http.server.HTTPServer(("127.0.0.1", 0), CrossOriginRedirectHandler)
+    port_a = int(server_a.server_address[1])
+    origin_custom = f"http://127.0.0.1:{port_a}"
+    thread_a = threading.Thread(target=server_a.serve_forever, daemon=True)
+    thread_a.start()
+
+    policy = HttpSecurityPolicy(
+        allowed_origins=[origin_custom, origin_b],
+        allow_loopback_for_testing=True,
+    )
+    executor = HttpNodeExecutor(policy)
+    token = CancellationToken()
+
+    headers = {
+        "aUtHoRiZaTiOn": "Bearer token-123",
+        "cOoKiE": "session=abc",
+        "pRoXy-AuThOrIzAtIoN": "Basic xyz",
+        "x-ApI-kEy": "secret-key-1",
+        "X-Auth-Token": "auth-token-9",
+        "Token": "simple-token",
+        "Secret": "confidential",
+        "X-Custom-Safe-Header": "safe-value",
+    }
+
+    context = ExecutionContext(
+        run_id="run-strip-headers",
+        node_key="strip_node",
+        node_type=NodeType.HTTP,
+        config={
+            "url": f"{origin_custom}/redirect_to_b",
+            "method": "GET",
+            "headers": headers,
+        },
+        inputs={},
+        cancellation_token=token,
+    )
+
+    try:
+        result = executor.execute(context)
+        assert result.output["status_code"] == 200
+        received_headers = result.output["body"]["headers"]
+
+        assert "authorization" not in received_headers
+        assert "cookie" not in received_headers
+        assert "proxy-authorization" not in received_headers
+        assert "x-api-key" not in received_headers
+        assert "x-auth-token" not in received_headers
+        assert "token" not in received_headers
+        assert "secret" not in received_headers
+
+        assert received_headers.get("x-custom-safe-header") == "safe-value"
+    finally:
+        server_a.shutdown()
+        server_a.server_close()
+
+
+def test_dynamic_http_request_configuration_templating(mock_server: tuple[str, int]) -> None:
+    base_url, port = mock_server
+    policy = HttpSecurityPolicy(
+        allowed_origins=[base_url],
+        allow_loopback_for_testing=True,
+    )
+    executor = HttpNodeExecutor(policy)
+    token = CancellationToken()
+
+    inputs = {
+        "steps": {
+            "trigger": {"endpoint": "items", "query_tag": "active"},
+            "transform": {"user_id": 1001, "role": "admin", "tags": ["ops", "dev"]},
+        }
+    }
+
+    context = ExecutionContext(
+        run_id="run-template-http",
+        node_key="template_http_node",
+        node_type=NodeType.HTTP,
+        config={
+            "url": f"{base_url}/{{{{ steps.trigger.endpoint }}}}",
+            "method": "POST",
+            "headers": {
+                "X-Custom-Header": "Role-{{ steps.transform.role }}",
+            },
+            "params": {
+                "filter": "{{ steps.trigger.query_tag }}",
+            },
+            "json": {
+                "account_id": "{{ steps.transform.user_id }}",
+                "assigned_tags": "{{ steps.transform.tags }}",
+            },
+        },
+        inputs=inputs,
+        cancellation_token=token,
+    )
+
+    result = executor.execute(context)
+    assert result.output["status_code"] == 201
+    body = result.output["body"]
+    assert body["received_path"] == "/items"
+    assert body["custom_header"] == "Role-admin"
+    assert body["body"]["account_id"] == 1001
+    assert body["body"]["assigned_tags"] == ["ops", "dev"]
 
 
 def test_http_error_status_discrimination(mock_server: tuple[str, int]) -> None:

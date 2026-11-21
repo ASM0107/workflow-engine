@@ -106,11 +106,13 @@ React + TypeScript Canvas UI (Planned M6)
 ### Node Execution Adapters & External Integrations (M5)
 - **Modular Executor Registry**: Dynamic dispatch by node type (`manual_trigger`, `http`, `json_transform`, `condition`, `delay`) with strongly-typed execution contexts and results.
 - **Hardened HTTP Execution**:
-  - **SSRF Prevention**: Blocks loopback (`127.0.0.0/8`, `::1`), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`), cloud metadata (`169.254.169.254`, `metadata.google.internal`), and reserved address spaces.
-  - **DNS Rebinding Mitigation**: Pre-resolves DNS and validates candidate IPs, establishing TCP sockets directly to validated IP addresses with proper SNI and Host headers.
-  - **Administrator Allowlists**: Enforces origin allowlists (`scheme://host:port`) and path prefix restrictions; rejects unrestricted URL execution.
-  - **Hop-by-Hop Redirect Validation**: Inspects redirects manually at every hop, re-validating origins, paths, and target IPs, while stripping sensitive `Authorization` headers on cross-origin redirects.
-  - **Bounded Execution Limits**: Enforces connect and read timeouts, response body byte limits via streaming reads, and maximum redirect hop budgets.
+  - **SSRF Prevention**: Blocks all non-globally-routable IPs (`not ip.is_global`), loopback (`127.0.0.0/8`, `::1`), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), link-local (`169.254.0.0/16`, `fe80::/10`), shared address space (`100.64.0.0/10`), Alibaba Cloud metadata (`100.100.100.200`), AWS/GCP/Azure/OCI metadata (`169.254.169.254`, `fd00:ec2::254`, `metadata.google.internal`, `instance-data`), and reserved address spaces. Test loopback bypass is strictly isolated to loopback addresses.
+  - **DNS Rebinding Mitigation**: Pre-resolves DNS and validates all candidate IPs (blocking if any returned IP is non-global or prohibited), establishing TCP sockets directly to validated IP addresses with proper SNI and Host headers.
+  - **Administrator Resource Ceilings**: Enforces non-bypassable administrator ceilings on connect/read timeouts and maximum response body bytes (`min(node_value, policy_ceiling)`). Non-positive, NaN, and infinite timeouts are strictly rejected with `PermanentExecutionError`.
+  - **Path-Segment Boundary Allowlist**: Validates canonical paths using segment boundary matching (e.g., `/api` permits `/api`, `/api/`, and `/api/v1`, but rejects `/api-admin`), and rejects directory traversal (`/..`, `..`), backslashes (`\`, `%5c`), encoded dots (`%2e`), and double encoding (`%25`).
+  - **Hop-by-Hop Redirect Validation & Credential Stripping**: Re-evaluates destination URL, origin allowlists, paths, and resolved IPs at every redirect hop. Cross-origin redirects strip sensitive headers case-insensitively (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `Api-Key`, `X-Auth-Token`, `Token`, `Secret`).
+  - **Bounded In-Flight Cancellation**: Socket operations (waiting for response headers and streaming body chunks) are sliced into $\le 100\text{ms}$ polling windows with `select.select`, checking `CancellationToken` to abort immediately upon lease loss.
+  - **Dynamic Request Configuration**: Fully supports `SafeTemplateEngine` interpolation across URLs, headers, query parameters, JSON bodies, and raw data payloads, preserving native JSON scalar and structured types and re-validating rendered URLs against all SSRF policies.
 - **Safe Declarative Transformations**:
   - **JMESPath Integration**: Declarative JSON filtering, projection, and array queries without script interpreters.
   - **Restricted Templating**: Safe interpolation syntax (`{{ steps.node.field }}`) preserving native scalar and object types, strictly rejecting code execution, `eval`, `exec`, or internal attribute access (`__`).
@@ -128,12 +130,12 @@ React + TypeScript Canvas UI (Planned M6)
 | **M2: PostgreSQL Persistence** | Schema, Alembic migrations, partial indexes, atomic run creation, repositories | **Completed** | 18 integration tests, 98% coverage |
 | **M3: Worker Engine** | Run-first locking, fair candidate discovery, atomic claiming, fenced leases, heartbeats, sweeper recovery | **Completed** | 27 integration & crash tests, 95% coverage |
 | **M4: DAG Execution** | Strict lock hierarchy (`runs` $\to$ `node_runs` $\to$ `edge_runs`), edge states, branch evaluation, reconvergent joins, multi-hop skips, terminal detection | **Completed** | 45 integration, lock ordering & oracle tests, 95% coverage |
-| **M5: Node Execution Adapters & External Integrations** | Executor registry & dispatch, secure HTTP adapter, SSRF safeguards, DNS rebinding mitigation, JMESPath transforms, failure discrimination | **Completed** | 59 adapter & integration tests, 95% coverage |
+| **M5: Node Execution Adapters & External Integrations** | Executor registry & dispatch, secure HTTP adapter, SSRF safeguards, resource ceilings, path boundary matching, credential stripping, templating, in-flight cancellation, JMESPath | **Completed** | 103 adapter & integration tests, 95% coverage |
 | **M6: REST API & Canvas UI** | FastAPI routes, WebSockets execution stream, React canvas editor | *Awaiting Authorization* | Planned |
 | **M7: Deployment & Acceptance** | Docker Compose orchestration, comprehensive end-to-end integration, benchmarks | *Pending M6* | Planned |
 
 > [!IMPORTANT]
-> **Milestone Status Notice**: Milestones M0, M1, M2, M3, M4, and M5 are fully implemented and verified against real PostgreSQL 18 (203/203 passing tests, 95% code coverage). Milestone M6 is awaiting human authorization before implementation begins.
+> **Milestone Status Notice**: Milestones M0, M1, M2, M3, M4, and M5 are fully implemented and verified against real PostgreSQL 18 (247/247 passing tests, 95% code coverage). Milestone M6 is awaiting human authorization before implementation begins.
 
 ---
 
