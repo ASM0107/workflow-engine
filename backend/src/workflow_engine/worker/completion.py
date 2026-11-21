@@ -506,6 +506,7 @@ class CompletionEngine:
         claimed_node: ClaimedNode,
         error_message: str,
         backoff_base_seconds: float = 1.0,
+        retryable: bool = True,
     ) -> bool:
         query_lock_run = """
             SELECT id, status
@@ -645,7 +646,7 @@ class CompletionEngine:
                         f"Expected exactly 1 running attempt to update, found {cur.rowcount}"
                     )
 
-                if claimed_node.attempt_number <= claimed_node.retry_limit:
+                if retryable and claimed_node.attempt_number <= claimed_node.retry_limit:
                     delay = min(
                         60.0,
                         backoff_base_seconds * (2 ** (claimed_node.attempt_number - 1)),

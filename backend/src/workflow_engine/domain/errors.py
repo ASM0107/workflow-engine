@@ -86,3 +86,39 @@ class LeaseLostError(WorkflowEngineError):
 
 class LockAcquisitionTimeout(WorkflowEngineError):
     pass
+
+
+class ExecutionError(WorkflowEngineError):
+    pass
+
+
+class PermanentExecutionError(ExecutionError):
+    pass
+
+
+class RetryableExecutionError(ExecutionError):
+    pass
+
+
+class SSRFSecurityError(PermanentExecutionError):
+    pass
+
+
+class AllowlistViolationError(PermanentExecutionError):
+    pass
+
+
+class ResponseSizeLimitExceededError(PermanentExecutionError):
+    pass
+
+
+class TimeoutExecutionError(RetryableExecutionError):
+    pass
+
+
+class TransformationError(PermanentExecutionError):
+    pass
+
+
+class UnregisteredExecutorError(PermanentExecutionError):
+    pass
