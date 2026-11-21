@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 from workflow_engine.adapters.base import ExecutionContext
 from workflow_engine.adapters.transform_adapter import (
@@ -224,3 +226,100 @@ def test_delay_invalid_duration_raises_permanent_error() -> None:
 
     with pytest.raises(PermanentExecutionError, match="cannot be negative"):
         executor.execute(context)
+
+
+def test_transform_query_returning_dict_and_non_string_validation() -> None:
+    executor = JsonTransformNodeExecutor()
+    token = CancellationToken()
+
+    invalid_ctx = ExecutionContext(
+        run_id="run-t-inv",
+        node_key="t_inv",
+        node_type=NodeType.JSON_TRANSFORM,
+        config={"query": 12345},
+        inputs={},
+        cancellation_token=token,
+    )
+    with pytest.raises(PermanentExecutionError, match="Query in JSON transform must be a string"):
+        executor.execute(invalid_ctx)
+
+    dict_ctx = ExecutionContext(
+        run_id="run-t-dict",
+        node_key="t_dict",
+        node_type=NodeType.JSON_TRANSFORM,
+        config={"query": "steps.data"},
+        inputs={"steps": {"data": {"alpha": 1, "beta": 2}}},
+        cancellation_token=token,
+    )
+    dict_res = executor.execute(dict_ctx)
+    assert dict_res.output["alpha"] == 1
+    assert dict_res.output["result"] == {"alpha": 1, "beta": 2}
+
+    empty_ctx = ExecutionContext(
+        run_id="run-t-empty",
+        node_key="t_empty",
+        node_type=NodeType.JSON_TRANSFORM,
+        config={},
+        inputs={"val": "default_passthrough"},
+        cancellation_token=token,
+    )
+    empty_res = executor.execute(empty_ctx)
+    assert "val" in empty_res.output["result"]
+
+
+def test_condition_node_executor_branches_and_fallbacks() -> None:
+    executor = ConditionNodeExecutor()
+    token = CancellationToken()
+
+    inv_ctx = ExecutionContext(
+        run_id="run-c-inv",
+        node_key="c_inv",
+        node_type=NodeType.CONDITION,
+        config={"query": ["not", "string"]},
+        inputs={},
+        cancellation_token=token,
+    )
+    with pytest.raises(PermanentExecutionError, match="Query in condition node must be a string"):
+        executor.execute(inv_ctx)
+
+    named_ctx = ExecutionContext(
+        run_id="run-c-named",
+        node_key="c_named",
+        node_type=NodeType.CONDITION,
+        config={"branch": "vip_branch"},
+        inputs={},
+        cancellation_token=token,
+    )
+    named_res = executor.execute(named_ctx)
+    assert named_res.output["result"] is True
+    assert named_res.output["branch"] == "vip_branch"
+
+    res_ctx = ExecutionContext(
+        run_id="run-c-res",
+        node_key="c_res",
+        node_type=NodeType.CONDITION,
+        config={"result": False},
+        inputs={},
+        cancellation_token=token,
+    )
+    res_out = executor.execute(res_ctx)
+    assert res_out.output["result"] is False
+    assert res_out.output["branch"] == "false"
+
+    default_ctx = ExecutionContext(
+        run_id="run-c-def",
+        node_key="c_def",
+        node_type=NodeType.CONDITION,
+        config={},
+        inputs={},
+        cancellation_token=token,
+    )
+    default_out = executor.execute(default_ctx)
+    assert default_out.output["result"] is True
+    assert default_out.output["branch"] == "default"
+
+
+def test_template_rendering_missing_key_evaluates_to_empty_string() -> None:
+    engine = SafeTemplateEngine()
+    data: dict[str, Any] = {"steps": {}}
+    assert engine.render_template("Value is: '{{ steps.missing.key }}'", data) == "Value is: ''"

@@ -261,3 +261,82 @@ def test_http_error_status_discrimination(mock_server: tuple[str, int]) -> None:
     )
     res_no_fail = executor.execute(ctx_no_fail)
     assert res_no_fail.output["status_code"] == 400
+
+
+def test_http_configuration_validation() -> None:
+    executor = HttpNodeExecutor(HttpSecurityPolicy(allowed_origins=["http://example.com"]))
+    token = CancellationToken()
+
+    missing_url_ctx = ExecutionContext(
+        run_id="run-no-url",
+        node_key="no_url",
+        node_type=NodeType.HTTP,
+        config={},
+        inputs={},
+        cancellation_token=token,
+    )
+    with pytest.raises(PermanentExecutionError, match="Missing 'url'"):
+        executor.execute(missing_url_ctx)
+
+    bad_method_ctx = ExecutionContext(
+        run_id="run-bad-method",
+        node_key="bad_method",
+        node_type=NodeType.HTTP,
+        config={"url": "http://example.com", "method": "OPTIONS"},
+        inputs={},
+        cancellation_token=token,
+    )
+    with pytest.raises(PermanentExecutionError, match="Unsupported HTTP method"):
+        executor.execute(bad_method_ctx)
+
+
+def test_http_data_body_formats(mock_server: tuple[str, int]) -> None:
+    base_url, port = mock_server
+    policy = HttpSecurityPolicy(
+        allowed_origins=[base_url],
+        allow_loopback_for_testing=True,
+    )
+    executor = HttpNodeExecutor(policy)
+    token = CancellationToken()
+
+    dict_ctx = ExecutionContext(
+        run_id="run-b-dict",
+        node_key="b_dict",
+        node_type=NodeType.HTTP,
+        config={"url": f"{base_url}/items", "method": "POST", "data": {"key": "val"}},
+        inputs={},
+        cancellation_token=token,
+    )
+    res_dict = executor.execute(dict_ctx)
+    assert res_dict.output["status_code"] == 201
+
+    bytes_ctx = ExecutionContext(
+        run_id="run-b-bytes",
+        node_key="b_bytes",
+        node_type=NodeType.HTTP,
+        config={"url": f"{base_url}/items", "method": "POST", "data": b'{"raw": 1}'},
+        inputs={},
+        cancellation_token=token,
+    )
+    res_bytes = executor.execute(bytes_ctx)
+    assert res_bytes.output["status_code"] == 201
+
+
+def test_direct_ip_https_connection_connect() -> None:
+    import unittest.mock
+
+    from workflow_engine.adapters.http_adapter import DirectIPHTTPSConnection
+
+    conn = DirectIPHTTPSConnection(
+        host="example.com",
+        port=443,
+        target_ip="93.184.216.34",
+        connect_timeout=2.0,
+        read_timeout=3.0,
+    )
+    mock_sock = unittest.mock.MagicMock()
+    with unittest.mock.patch("socket.create_connection", return_value=mock_sock):
+        with unittest.mock.patch.object(conn.ssl_context, "wrap_socket", return_value=mock_sock):
+            conn.connect()
+            assert conn.sock is mock_sock
+            mock_sock.settimeout.assert_called_with(3.0)
