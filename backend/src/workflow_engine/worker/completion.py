@@ -24,6 +24,23 @@ class CompletionEngine:
             FOR UPDATE;
         """
 
+        query_lock_node_runs = """
+            SELECT id, node_key, status, lease_owner, lease_generation,
+                   (lease_expires_at > clock_timestamp()) AS is_unexpired
+            FROM node_runs
+            WHERE run_id = %s
+            ORDER BY node_key ASC
+            FOR UPDATE;
+        """
+
+        query_lock_edge_runs = """
+            SELECT id, edge_key, from_node_key, to_node_key, status
+            FROM edge_runs
+            WHERE run_id = %s
+            ORDER BY edge_key ASC
+            FOR UPDATE;
+        """
+
         query_fenced_node_success = """
             UPDATE node_runs
             SET status = 'SUCCEEDED',
@@ -68,6 +85,29 @@ class CompletionEngine:
                         raise FencingTokenError(
                             f"Run '{claimed_node.run_id}' not in RUNNING state. "
                             "Completion rejected."
+                        )
+
+                    cur.execute(query_lock_node_runs, (claimed_node.run_id,))
+                    locked_nodes = cur.fetchall()
+
+                    cur.execute(query_lock_edge_runs, (claimed_node.run_id,))
+                    cur.fetchall()
+
+                    target_node = next(
+                        (n for n in locked_nodes if n["id"] == claimed_node.node_run_id),
+                        None,
+                    )
+                    if (
+                        not target_node
+                        or target_node["lease_owner"] != claimed_node.worker_id
+                        or target_node["lease_generation"] != claimed_node.lease_generation
+                        or target_node["status"] != "RUNNING"
+                        or not target_node["is_unexpired"]
+                    ):
+                        conn.rollback()
+                        raise FencingTokenError(
+                            f"Fencing token check failed for node '{claimed_node.node_key}' "
+                            f"(generation {claimed_node.lease_generation}). Completion rejected."
                         )
 
                     cur.execute(
@@ -151,8 +191,7 @@ class CompletionEngine:
              AND we.edge_key = er.edge_key
             WHERE er.run_id = %s
               AND er.from_node_key = %s
-            ORDER BY er.edge_key ASC
-            FOR UPDATE OF er;
+            ORDER BY er.edge_key ASC;
         """
         cur.execute(query_fetch_edges, (claimed_node.run_id, claimed_node.node_key))
         outgoing_rows = cur.fetchall()
@@ -280,8 +319,7 @@ class CompletionEngine:
                     AND er.to_node_key = nr.node_key
                     AND er.status != 'DEAD'
               )
-            ORDER BY nr.node_key ASC
-            FOR UPDATE OF nr;
+            ORDER BY nr.node_key ASC;
         """
 
         query_skip_node = """
@@ -384,8 +422,7 @@ class CompletionEngine:
                     AND er.to_node_key = nr.node_key
                     AND er.status = 'TAKEN'
               )
-            ORDER BY nr.node_key ASC
-            FOR UPDATE OF nr;
+            ORDER BY nr.node_key ASC;
         """
 
         query_promote = """
@@ -477,14 +514,12 @@ class CompletionEngine:
             FOR UPDATE;
         """
 
-        query_fenced_check = """
-            SELECT id
+        query_lock_node_runs = """
+            SELECT id, node_key, status, lease_owner, lease_generation,
+                   (lease_expires_at > clock_timestamp()) AS is_unexpired
             FROM node_runs
-            WHERE id = %s
-              AND lease_owner = %s
-              AND lease_generation = %s
-              AND status = 'RUNNING'
-              AND lease_expires_at > clock_timestamp()
+            WHERE run_id = %s
+            ORDER BY node_key ASC
             FOR UPDATE;
         """
 
@@ -575,16 +610,20 @@ class CompletionEngine:
                         f"Run '{claimed_node.run_id}' is not in RUNNING state. Failure rejected."
                     )
 
-                cur.execute(
-                    query_fenced_check,
-                    (
-                        claimed_node.node_run_id,
-                        claimed_node.worker_id,
-                        claimed_node.lease_generation,
-                    ),
+                cur.execute(query_lock_node_runs, (claimed_node.run_id,))
+                locked_nodes = cur.fetchall()
+
+                target_node = next(
+                    (n for n in locked_nodes if n["id"] == claimed_node.node_run_id),
+                    None,
                 )
-                node_check = cur.fetchone()
-                if not node_check:
+                if (
+                    not target_node
+                    or target_node["lease_owner"] != claimed_node.worker_id
+                    or target_node["lease_generation"] != claimed_node.lease_generation
+                    or target_node["status"] != "RUNNING"
+                    or not target_node["is_unexpired"]
+                ):
                     conn.rollback()
                     raise FencingTokenError(
                         f"Fencing token check failed for node '{claimed_node.node_key}' "

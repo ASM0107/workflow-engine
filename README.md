@@ -88,19 +88,20 @@ React + TypeScript Canvas UI (Planned M6)
 - **Differential Oracle Agreement**: 100% agreement between database state transitions and the pure Python in-memory semantic reference oracle.
 
 ### Worker Engine & Lease Fencing (M3)
-- **Hierarchical Run-First Locking**: Every claiming, heartbeat, completion, and sweeper transaction locks the parent run row first (`SELECT id FROM runs WHERE id = %s FOR UPDATE;`), preventing deadlocks and race conditions.
+- **Hierarchical Run-First Locking**: Every claiming, heartbeat, completion, and sweeper transaction enforces the strict lock hierarchy (`runs` $\to$ `node_runs` $\to$ `edge_runs`) in deterministic key order (`ORDER BY node_key ASC`, `ORDER BY edge_key ASC`), completely eliminating lock inversions and deadlocks.
 - **Fair Round-Robin Scheduling**: Fair run candidate discovery uses `SKIP LOCKED` and updates `last_claimed_at` upon claim, preventing starvation of active runs.
 - **Monotonic Lease Generations**: Atomic node claim increments `lease_generation` and sets a short-lived `lease_expires_at`.
 - **Fenced Heartbeat Monitor**: Background heartbeat thread extends leases with monotonic token fencing; immediately aborts local execution via `CancellationToken` if lease is lost.
 - **Background Sweeper Recovery**: Sweeper identifies expired leases, safely transitions orphaned nodes to `READY` or `FAILED`, enforces exponential retry backoff, and performs atomic fail-fast cancellation on permanent failure.
 
 ### Database-Backed DAG Execution (M4)
+- **Strict Lock Hierarchy Enforcement**: Completion and failure transactions acquire the parent `runs` row lock first, all run `node_runs` locks second in `node_key ASC` order, and all run `edge_runs` locks third in `edge_key ASC` order before executing downstream mutations.
 - **Database-Backed Edge Transitions**: Node completion updates outgoing `edge_runs` to `TAKEN` or `DEAD` and emits `EDGE_TAKEN` / `EDGE_DEAD` audit events.
 - **Dynamic Branch Evaluation**: Evaluates conditional branch outputs (`result: bool`, `branch: str`, or fallback `default`), seamlessly integrated with the pure M1 evaluator logic.
 - **Inclusive OR Join Reconvergence**: Reconvergent join nodes are evaluated in the database: promoted to `READY` iff all incoming edges are resolved and at least one is `TAKEN`; transitioned to `SKIPPED` iff all incoming edges are `DEAD`.
 - **Transactional Multi-Hop Skip Cascade**: When a path becomes dead, all downstream dependencies cascade transitively to `SKIPPED` until fixed-point convergence within the single parent run-locked transaction.
 - **Terminal Run Detection**: When non-terminal nodes reach zero (`COUNT(status NOT IN ('SUCCEEDED', 'SKIPPED')) == 0`), parent run atomically transitions from `RUNNING` to `SUCCEEDED` and emits `RUN_SUCCEEDED`.
-- **Differential Oracle Verification**: Full execution across diamond, multi-root, cascading, and reconvergent workflows verified for 100% differential state agreement against M1 in-memory DAG oracle.
+- **Differential Oracle Verification**: Full execution across diamond, multi-root, cascading, and reconvergent workflows verified for 100% differential state and output agreement against M1 in-memory DAG oracle.
 
 ---
 
@@ -112,19 +113,19 @@ React + TypeScript Canvas UI (Planned M6)
 | **M1: Pure In-Memory DAG Engine** | Graph validator, topological sorter, branch evaluator, skip propagation, in-memory reference oracle | **Completed** | 54 unit tests, 99% coverage |
 | **M2: PostgreSQL Persistence** | Schema, Alembic migrations, partial indexes, atomic run creation, repositories | **Completed** | 18 integration tests, 98% coverage |
 | **M3: Worker Engine** | Run-first locking, fair candidate discovery, atomic claiming, fenced leases, heartbeats, sweeper recovery | **Completed** | 27 integration & crash tests, 95% coverage |
-| **M4: DAG Execution** | Database-backed edge states, branch evaluation, reconvergent joins, transactional multi-hop skips, terminal detection | **Completed** | 35 integration & oracle tests, 95% coverage |
-| **M5: Resilience & Recovery** | Crash recovery sweeper, retry scheduling, exponential backoff, cooperative cancellation | *Awaiting Authorization* | Planned |
+| **M4: DAG Execution** | Strict lock hierarchy (`runs` $\to$ `node_runs` $\to$ `edge_runs`), edge states, branch evaluation, reconvergent joins, multi-hop skips, terminal detection | **Completed** | 45 integration, lock ordering & oracle tests, 95% coverage |
+| **M5: Node Execution Adapters & External Integrations** | Executor registry & node-type dispatch, HTTP execution, administrator allowlists, SSRF safeguards, timeouts & size limits, JMESPath transforms, external I/O outside transactions | *Awaiting Authorization* | Planned |
 | **M6: REST API & Canvas UI** | FastAPI routes, WebSockets execution stream, React canvas editor | *Pending M5* | Planned |
 | **M7: Deployment & Acceptance** | Docker Compose orchestration, comprehensive end-to-end integration, benchmarks | *Pending M6* | Planned |
 
 > [!IMPORTANT]
-> **Milestone Status Notice**: Milestones M0, M1, M2, M3, and M4 are fully implemented and verified against real PostgreSQL 18 (134/134 passing tests, 95% code coverage). Milestone M5 is awaiting human authorization before implementation begins.
+> **Milestone Status Notice**: Milestones M0, M1, M2, M3, and M4 are fully implemented and verified against real PostgreSQL 18 (144/144 passing tests, 95% code coverage). Milestone M5 is awaiting human authorization before implementation begins.
 
 ---
 
 ## 6. Known Limitations
 
-- **No External HTTP Execution Yet (M5 Planned)**: Full external HTTP requests and payload transforms are staged for the worker integration phase.
+- **No External HTTP Execution Yet (M5 Planned)**: Node execution adapters (HTTP executor with SSRF protections, origin allowlists, timeouts, response size limits) and JMESPath transformation adapters are staged for M5.
 - **No Web UI / REST Endpoints Yet (M6 Planned)**: Interaction is currently programmatically driven via the Python repository API, worker engines, and test suites.
 
 ---
@@ -207,9 +208,9 @@ ruff check .
 tests/test_dag/test_*.py (54 items) .................... PASSED
 tests/test_persistence/test_*.py (18 items) ........... PASSED
 tests/test_worker/test_*.py (27 items) ................ PASSED
-tests/test_execution/test_exec_*.py (35 items) ........ PASSED
+tests/test_execution/test_exec_*.py (45 items) ........ PASSED
 
-============================= 134 passed in 67.72s =============================
+============================= 144 passed in 60.34s =============================
 Coverage: 95%
 ```
 

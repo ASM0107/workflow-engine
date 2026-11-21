@@ -294,6 +294,13 @@ class RunRepository:
             WHERE id = %s
             FOR UPDATE;
         """
+        query_lock_node_runs = """
+            SELECT id, node_key
+            FROM node_runs
+            WHERE run_id = %s
+            ORDER BY node_key ASC
+            FOR UPDATE;
+        """
         query_cancel_run = """
             UPDATE runs
             SET status = 'CANCELLED',
@@ -343,6 +350,8 @@ class RunRepository:
                         raise RunNotFoundError(f"Run '{run_id}' not found")
                     if row["status"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
                         return
+                    cur.execute(query_lock_node_runs, (run_id,))
+                    cur.fetchall()
                     cur.execute(query_cancel_run, (run_id,))
                     cur.execute(query_cancel_running, (run_id,))
                     cur.execute(query_cancel_pending_ready, (run_id,))
