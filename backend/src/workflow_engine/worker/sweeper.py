@@ -31,7 +31,21 @@ class LeaseRecoverySweeper:
             WHERE nr.run_id = %s
               AND nr.status = 'RUNNING'
               AND nr.lease_expires_at < clock_timestamp()
+            ORDER BY nr.created_at ASC
             FOR UPDATE OF nr;
+        """
+
+        query_verify_node_active = """
+            SELECT nr.id
+            FROM node_runs nr
+            JOIN runs r ON nr.run_id = r.id
+            WHERE nr.id = %s
+              AND nr.run_id = %s
+              AND r.status IN ('QUEUED', 'RUNNING')
+              AND nr.status = 'RUNNING'
+              AND nr.lease_owner = %s
+              AND nr.lease_generation = %s
+              AND nr.lease_expires_at < clock_timestamp();
         """
 
         query_timeout_attempt = """
@@ -39,7 +53,10 @@ class LeaseRecoverySweeper:
             SET status = 'TIMED_OUT',
                 error = 'Lease expired without worker heartbeat',
                 completed_at = clock_timestamp()
-            WHERE node_run_id = %s AND status = 'RUNNING';
+            WHERE node_run_id = %s
+              AND worker_id = %s
+              AND lease_generation = %s
+              AND status = 'RUNNING';
         """
 
         query_count_attempts = """
@@ -57,7 +74,11 @@ class LeaseRecoverySweeper:
                 run_after = clock_timestamp() + (%s * INTERVAL '1 second'),
                 error = 'Lease expired; recovered to READY',
                 updated_at = clock_timestamp()
-            WHERE id = %s;
+            WHERE id = %s
+              AND lease_owner = %s
+              AND lease_generation = %s
+              AND status = 'RUNNING'
+              AND lease_expires_at < clock_timestamp();
         """
 
         query_fail_node = """
@@ -67,7 +88,10 @@ class LeaseRecoverySweeper:
                 lease_expires_at = NULL,
                 error = 'Lease expired and retry limit exceeded',
                 updated_at = clock_timestamp()
-            WHERE id = %s;
+            WHERE id = %s
+              AND lease_owner = %s
+              AND lease_generation = %s
+              AND status = 'RUNNING';
         """
 
         query_fail_run = """
@@ -139,9 +163,24 @@ class LeaseRecoverySweeper:
                     for node in expired_nodes:
                         node_id: str = node["id"]
                         node_key: str = node["node_key"]
+                        lease_owner: str = node["lease_owner"]
+                        lease_generation: int = node["lease_generation"]
                         retry_limit: int = node["retry_limit"]
 
-                        cur.execute(query_timeout_attempt, (node_id,))
+                        cur.execute(
+                            query_verify_node_active,
+                            (node_id, run_id, lease_owner, lease_generation),
+                        )
+                        if not cur.fetchone():
+                            continue
+
+                        cur.execute(
+                            query_timeout_attempt,
+                            (node_id, lease_owner, lease_generation),
+                        )
+                        if cur.rowcount != 1:
+                            continue
+
                         cur.execute(query_count_attempts, (node_id,))
                         count_row = cur.fetchone()
                         attempt_count: int = count_row["attempt_count"] if count_row else 1
@@ -151,7 +190,12 @@ class LeaseRecoverySweeper:
                                 60.0,
                                 backoff_base_seconds * (2 ** (attempt_count - 1)),
                             )
-                            cur.execute(query_recover_node, (delay, node_id))
+                            cur.execute(
+                                query_recover_node,
+                                (delay, node_id, lease_owner, lease_generation),
+                            )
+                            if cur.rowcount != 1:
+                                continue
                             recovered_count += 1
 
                             event_id = uuid.uuid4().hex
@@ -164,7 +208,7 @@ class LeaseRecoverySweeper:
                                     json.dumps(
                                         {
                                             "node_key": node_key,
-                                            "previous_worker": node["lease_owner"],
+                                            "previous_worker": lease_owner,
                                             "retry_delay_seconds": delay,
                                             "attempts": attempt_count,
                                         }
@@ -172,7 +216,13 @@ class LeaseRecoverySweeper:
                                 ),
                             )
                         else:
-                            cur.execute(query_fail_node, (node_id,))
+                            cur.execute(
+                                query_fail_node,
+                                (node_id, lease_owner, lease_generation),
+                            )
+                            if cur.rowcount != 1:
+                                continue
+
                             cur.execute(query_fail_run, (run_id,))
                             cur.execute(query_cancel_running_siblings, (run_id, node_id))
                             cur.execute(query_cancel_pending_and_ready, (run_id,))
@@ -208,6 +258,7 @@ class LeaseRecoverySweeper:
                                     ),
                                 ),
                             )
+                            break
 
                     conn.commit()
 
