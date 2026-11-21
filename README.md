@@ -103,6 +103,20 @@ React + TypeScript Canvas UI (Planned M6)
 - **Terminal Run Detection**: When non-terminal nodes reach zero (`COUNT(status NOT IN ('SUCCEEDED', 'SKIPPED')) == 0`), parent run atomically transitions from `RUNNING` to `SUCCEEDED` and emits `RUN_SUCCEEDED`.
 - **Differential Oracle Verification**: Full execution across diamond, multi-root, cascading, and reconvergent workflows verified for 100% differential state and output agreement against M1 in-memory DAG oracle.
 
+### Node Execution Adapters & External Integrations (M5)
+- **Modular Executor Registry**: Dynamic dispatch by node type (`manual_trigger`, `http`, `json_transform`, `condition`, `delay`) with strongly-typed execution contexts and results.
+- **Hardened HTTP Execution**:
+  - **SSRF Prevention**: Blocks loopback (`127.0.0.0/8`, `::1`), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`), cloud metadata (`169.254.169.254`, `metadata.google.internal`), and reserved address spaces.
+  - **DNS Rebinding Mitigation**: Pre-resolves DNS and validates candidate IPs, establishing TCP sockets directly to validated IP addresses with proper SNI and Host headers.
+  - **Administrator Allowlists**: Enforces origin allowlists (`scheme://host:port`) and path prefix restrictions; rejects unrestricted URL execution.
+  - **Hop-by-Hop Redirect Validation**: Inspects redirects manually at every hop, re-validating origins, paths, and target IPs, while stripping sensitive `Authorization` headers on cross-origin redirects.
+  - **Bounded Execution Limits**: Enforces connect and read timeouts, response body byte limits via streaming reads, and maximum redirect hop budgets.
+- **Safe Declarative Transformations**:
+  - **JMESPath Integration**: Declarative JSON filtering, projection, and array queries without script interpreters.
+  - **Restricted Templating**: Safe interpolation syntax (`{{ steps.node.field }}`) preserving native scalar and object types, strictly rejecting code execution, `eval`, `exec`, or internal attribute access (`__`).
+- **Standardized Failure Discrimination**: Differentiates `PermanentExecutionError` (fails fast immediately on attempt 1 without wasteful retries) from `RetryableExecutionError` (schedules exponential retry backoff).
+- **Out-of-Transaction I/O**: Network calls and transforms run strictly outside database transactions, preserving atomic run-first locking and fenced lease protections.
+
 ---
 
 ## 5. Implementation Status & Milestones
@@ -114,19 +128,18 @@ React + TypeScript Canvas UI (Planned M6)
 | **M2: PostgreSQL Persistence** | Schema, Alembic migrations, partial indexes, atomic run creation, repositories | **Completed** | 18 integration tests, 98% coverage |
 | **M3: Worker Engine** | Run-first locking, fair candidate discovery, atomic claiming, fenced leases, heartbeats, sweeper recovery | **Completed** | 27 integration & crash tests, 95% coverage |
 | **M4: DAG Execution** | Strict lock hierarchy (`runs` $\to$ `node_runs` $\to$ `edge_runs`), edge states, branch evaluation, reconvergent joins, multi-hop skips, terminal detection | **Completed** | 45 integration, lock ordering & oracle tests, 95% coverage |
-| **M5: Node Execution Adapters & External Integrations** | Executor registry & node-type dispatch, HTTP execution, administrator allowlists, SSRF safeguards, timeouts & size limits, JMESPath transforms, external I/O outside transactions | *Awaiting Authorization* | Planned |
-| **M6: REST API & Canvas UI** | FastAPI routes, WebSockets execution stream, React canvas editor | *Pending M5* | Planned |
+| **M5: Node Execution Adapters & External Integrations** | Executor registry & dispatch, secure HTTP adapter, SSRF safeguards, DNS rebinding mitigation, JMESPath transforms, failure discrimination | **Completed** | 59 adapter & integration tests, 95% coverage |
+| **M6: REST API & Canvas UI** | FastAPI routes, WebSockets execution stream, React canvas editor | *Awaiting Authorization* | Planned |
 | **M7: Deployment & Acceptance** | Docker Compose orchestration, comprehensive end-to-end integration, benchmarks | *Pending M6* | Planned |
 
 > [!IMPORTANT]
-> **Milestone Status Notice**: Milestones M0, M1, M2, M3, and M4 are fully implemented and verified against real PostgreSQL 18 (144/144 passing tests, 95% code coverage). Milestone M5 is awaiting human authorization before implementation begins.
+> **Milestone Status Notice**: Milestones M0, M1, M2, M3, M4, and M5 are fully implemented and verified against real PostgreSQL 18 (203/203 passing tests, 95% code coverage). Milestone M6 is awaiting human authorization before implementation begins.
 
 ---
 
 ## 6. Known Limitations
 
-- **No External HTTP Execution Yet (M5 Planned)**: Node execution adapters (HTTP executor with SSRF protections, origin allowlists, timeouts, response size limits) and JMESPath transformation adapters are staged for M5.
-- **No Web UI / REST Endpoints Yet (M6 Planned)**: Interaction is currently programmatically driven via the Python repository API, worker engines, and test suites.
+- **No Web UI / REST Endpoints Yet (M6 Planned)**: Interaction is currently programmatically driven via the Python repository API, worker engines, and test suites. REST endpoints and the React workflow canvas are scheduled for M6.
 
 ---
 
@@ -209,8 +222,9 @@ tests/test_dag/test_*.py (54 items) .................... PASSED
 tests/test_persistence/test_*.py (18 items) ........... PASSED
 tests/test_worker/test_*.py (27 items) ................ PASSED
 tests/test_execution/test_exec_*.py (45 items) ........ PASSED
+tests/test_adapters/test_*.py (59 items) ............... PASSED
 
-============================= 144 passed in 60.34s =============================
+============================= 203 passed in 90.84s =============================
 Coverage: 95%
 ```
 
