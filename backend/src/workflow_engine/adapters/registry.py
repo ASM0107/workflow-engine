@@ -1,6 +1,11 @@
+from typing import TYPE_CHECKING
+
 from workflow_engine.adapters.base import ExecutionContext, ExecutionResult, NodeExecutor
 from workflow_engine.domain.errors import UnregisteredExecutorError
 from workflow_engine.domain.types import NodeType
+
+if TYPE_CHECKING:
+    from workflow_engine.adapters.http_adapter import HttpSecurityPolicy
 
 
 class ExecutorRegistry:
@@ -27,3 +32,23 @@ class ExecutorRegistry:
     def execute(self, context: ExecutionContext) -> ExecutionResult:
         executor = self.get(context.node_type)
         return executor.execute(context)
+
+
+def create_default_registry(
+    http_policy: "HttpSecurityPolicy | None" = None,
+) -> ExecutorRegistry:
+    from workflow_engine.adapters.http_adapter import HttpNodeExecutor
+    from workflow_engine.adapters.transform_adapter import (
+        ConditionNodeExecutor,
+        DelayNodeExecutor,
+        JsonTransformNodeExecutor,
+        ManualTriggerNodeExecutor,
+    )
+
+    registry = ExecutorRegistry()
+    registry.register(NodeType.MANUAL_TRIGGER, ManualTriggerNodeExecutor())
+    registry.register(NodeType.HTTP, HttpNodeExecutor(http_policy))
+    registry.register(NodeType.JSON_TRANSFORM, JsonTransformNodeExecutor())
+    registry.register(NodeType.CONDITION, ConditionNodeExecutor())
+    registry.register(NodeType.DELAY, DelayNodeExecutor())
+    return registry
