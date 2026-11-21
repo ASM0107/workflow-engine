@@ -75,15 +75,26 @@ class WorkflowWorker:
         try:
             callback_params = list(inspect.signature(executor_callback).parameters.values())
             if len(callback_params) >= 2:
-                output = executor_callback(claimed_node, cancellation_token)
+                result = executor_callback(claimed_node, cancellation_token)
             else:
-                output = executor_callback(claimed_node)
+                result = executor_callback(claimed_node)
 
             cancellation_token.check_cancelled()
             monitor.check_lease_validity()
             monitor.stop()
 
-            self.completion_engine.complete_success(claimed_node, output or {})
+            output: dict[str, Any] | None = None
+            selected_edge_ids: list[str] | None = None
+            if isinstance(result, tuple) and len(result) == 2:
+                output, selected_edge_ids = result
+            elif isinstance(result, dict):
+                output = result
+
+            self.completion_engine.complete_success(
+                claimed_node,
+                output=output or {},
+                selected_edge_ids=selected_edge_ids,
+            )
             return True
         except (FencingTokenError, LeaseLostError):
             monitor.stop()

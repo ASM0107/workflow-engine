@@ -286,3 +286,71 @@ class RunRepository:
                 cur.execute(query, (run_id,))
                 rows = cur.fetchall()
                 return [dict(row) for row in rows]
+
+    def cancel_run(self, run_id: str) -> None:
+        query_lock_run = """
+            SELECT id, status
+            FROM runs
+            WHERE id = %s
+            FOR UPDATE;
+        """
+        query_cancel_run = """
+            UPDATE runs
+            SET status = 'CANCELLED',
+                updated_at = clock_timestamp()
+            WHERE id = %s
+              AND status IN ('QUEUED', 'RUNNING');
+        """
+        query_cancel_running = """
+            WITH cancelled_nodes AS (
+                UPDATE node_runs
+                SET status = 'CANCELLED',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    lease_generation = lease_generation + 1,
+                    error = 'Run was cancelled',
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                  AND status = 'RUNNING'
+                RETURNING id
+            )
+            UPDATE node_attempts
+            SET status = 'CANCELLED',
+                error = 'Run was cancelled',
+                completed_at = clock_timestamp()
+            WHERE node_run_id IN (SELECT id FROM cancelled_nodes)
+              AND status = 'RUNNING';
+        """
+        query_cancel_pending_ready = """
+            UPDATE node_runs
+            SET status = 'CANCELLED',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = clock_timestamp()
+            WHERE run_id = %s
+              AND status IN ('PENDING', 'READY');
+        """
+        query_event = """
+            INSERT INTO run_events (id, run_id, event_type, payload)
+            VALUES (%s, %s, 'RUN_CANCELLED', %s);
+        """
+        with get_connection() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(query_lock_run, (run_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        raise RunNotFoundError(f"Run '{run_id}' not found")
+                    if row["status"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
+                        return
+                    cur.execute(query_cancel_run, (run_id,))
+                    cur.execute(query_cancel_running, (run_id,))
+                    cur.execute(query_cancel_pending_ready, (run_id,))
+                    cur.execute(
+                        query_event,
+                        (uuid.uuid4().hex, run_id, json.dumps({"run_id": run_id})),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise

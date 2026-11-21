@@ -1,8 +1,9 @@
 from typing import Callable
 
 import pytest
-from workflow_engine.domain.entities import Node, NodeType, WorkflowDefinition
+from workflow_engine.domain.entities import Node, WorkflowDefinition
 from workflow_engine.domain.errors import FencingTokenError
+from workflow_engine.domain.types import NodeType
 from workflow_engine.persistence.connection import get_connection
 from workflow_engine.persistence.repositories import RunRepository
 from workflow_engine.worker.claim import ClaimEngine
