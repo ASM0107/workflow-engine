@@ -1,3 +1,4 @@
+import collections.abc
 import http.client
 import io
 import ipaddress
@@ -68,113 +69,232 @@ def _resolve_bounded_timeout(val: Any, ceiling: float, name: str) -> float:
     return min(timeout, ceiling)
 
 
-def _resolve_bounded_max_bytes(val: Any, ceiling: int) -> int:
+def _resolve_bounded_max_bytes(val: Any, ceiling: int, name: str = "max_response_bytes") -> int:
     if val is None:
         return ceiling
     if isinstance(val, bool):
-        raise PermanentExecutionError("max_response_bytes cannot be a boolean")
+        raise PermanentExecutionError(f"{name} cannot be a boolean")
     if isinstance(val, float):
-        raise PermanentExecutionError("max_response_bytes must be an integer, not a float")
+        raise PermanentExecutionError(f"{name} must be an integer, not a float")
     try:
         if isinstance(val, str):
             if "." in val or "e" in val.lower():
-                raise PermanentExecutionError(f"max_response_bytes must be an integer, got '{val}'")
+                raise PermanentExecutionError(f"{name} must be an integer, got '{val}'")
         bytes_val = int(val)
     except (ValueError, TypeError, OverflowError) as exc:
         raise PermanentExecutionError(
-            f"Invalid max_response_bytes '{val}': must be a positive integer"
+            f"Invalid {name} '{val}': must be a positive integer"
         ) from exc
     if bytes_val <= 0:
-        raise PermanentExecutionError(f"max_response_bytes must be positive, got {bytes_val}")
+        raise PermanentExecutionError(f"{name} must be positive, got {bytes_val}")
     return min(bytes_val, ceiling)
 
 
-def _wait_for_readable(
-    sock: socket.socket,
-    timeout: float,
-    token: CancellationToken,
-    slice_interval: float = 0.05,
-) -> None:
-    start_time = time.monotonic()
-    while True:
-        token.check_cancelled()
-        if isinstance(sock, ssl.SSLSocket):
-            if sock.pending() > 0:
-                return
-        elapsed = time.monotonic() - start_time
-        remaining = timeout - elapsed
-        if remaining <= 0:
-            raise TimeoutExecutionError("HTTP socket read timed out")
-        wait_time = min(slice_interval, remaining)
-        rlist, _, _ = select.select([sock], [], [], wait_time)
-        if rlist:
-            return
+class SocketRawIO(io.RawIOBase):
+    def readable(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        pass
 
 
-def _read_headers_cancellation_aware(
-    sock: socket.socket,
-    timeout: float,
-    token: CancellationToken,
-    slice_interval: float = 0.05,
-) -> bytes:
-    buffer = bytearray()
-    start_time = time.monotonic()
-    while True:
-        token.check_cancelled()
-        elapsed = time.monotonic() - start_time
-        remaining = timeout - elapsed
-        if remaining <= 0:
-            raise TimeoutExecutionError("HTTP timeout waiting for response headers")
+class CancellableResponseStream(io.BufferedReader):
+    def __init__(
+        self,
+        sock: socket.socket,
+        token: CancellationToken,
+        read_timeout: float,
+        max_header_bytes: int = 64 * 1024,
+        slice_interval: float = 0.05,
+    ) -> None:
+        super().__init__(SocketRawIO())
+        self.sock = sock
+        self.token = token
+        self.read_timeout = read_timeout
+        self.max_header_bytes = max_header_bytes
+        self.slice_interval = slice_interval
+        self.buffer = bytearray()
+        self.total_header_bytes = 0
+        self.is_reading_headers = True
 
-        if isinstance(sock, ssl.SSLSocket) and sock.pending() > 0:
-            can_read = True
-        else:
-            wait_time = min(slice_interval, remaining)
-            rlist, _, _ = select.select([sock], [], [], wait_time)
-            can_read = bool(rlist)
+    def readable(self) -> bool:
+        return True
 
-        if can_read:
-            chunk = sock.recv(4096)
+    def has_buffered_data(self) -> bool:
+        return len(self.buffer) > 0
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        if not self.closed:
+            super().close()
+
+    def _fill_buffer(self) -> int:
+        start_time = time.monotonic()
+        while True:
+            self.token.check_cancelled()
+            elapsed = time.monotonic() - start_time
+            remaining = self.read_timeout - elapsed
+            if remaining <= 0:
+                raise TimeoutExecutionError("HTTP timeout reading from socket")
+
+            if isinstance(self.sock, ssl.SSLSocket) and self.sock.pending() > 0:
+                can_read = True
+            else:
+                wait_time = min(self.slice_interval, remaining)
+                rlist, _, _ = select.select([self.sock], [], [], wait_time)
+                can_read = bool(rlist)
+
+            if can_read:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    return 0
+                self.buffer.extend(chunk)
+                return len(chunk)
+
+    def readline(self, size: int | None = -1) -> bytes:
+        limit = -1 if size is None else size
+        while True:
+            idx = self.buffer.find(b"\n")
+            if idx >= 0:
+                amt = idx + 1
+                if limit >= 0 and amt > limit:
+                    amt = limit
+                chunk = bytes(self.buffer[:amt])
+                del self.buffer[:amt]
+                if self.is_reading_headers:
+                    self.total_header_bytes += len(chunk)
+                    if self.total_header_bytes > self.max_header_bytes:
+                        raise ResponseSizeLimitExceededError(
+                            f"Response headers exceeded limit of {self.max_header_bytes} bytes"
+                        )
+                return chunk
+
+            n = self._fill_buffer()
+            if n == 0:
+                amt = len(self.buffer) if limit < 0 else min(limit, len(self.buffer))
+                chunk = bytes(self.buffer[:amt])
+                del self.buffer[:amt]
+                if self.is_reading_headers:
+                    self.total_header_bytes += len(chunk)
+                    if self.total_header_bytes > self.max_header_bytes:
+                        raise ResponseSizeLimitExceededError(
+                            f"Response headers exceeded limit of {self.max_header_bytes} bytes"
+                        )
+                return chunk
+
+    def read1(self, size: int = -1) -> bytes:
+        if not self.buffer:
+            bytes_read = self._fill_buffer()
+            if bytes_read == 0:
+                return b""
+        amt = len(self.buffer) if size < 0 else min(size, len(self.buffer))
+        chunk = bytes(self.buffer[:amt])
+        del self.buffer[:amt]
+        return chunk
+
+    def read(self, size: int | None = -1) -> bytes:
+        n = -1 if size is None else size
+        if n == 0:
+            return b""
+        if n < 0:
+            result = bytearray()
+            while True:
+                chunk = self.read1(-1)
+                if not chunk:
+                    break
+                result.extend(chunk)
+            return bytes(result)
+        result = bytearray()
+        while len(result) < n:
+            chunk = self.read1(n - len(result))
             if not chunk:
                 break
-            buffer.extend(chunk)
-            if b"\r\n\r\n" in buffer or b"\n\n" in buffer:
-                break
+            result.extend(chunk)
+        return bytes(result)
 
-    token.check_cancelled()
-    return bytes(buffer)
+    def readinto(self, b: Any) -> int:
+        chunk = self.read1(len(b))
+        amt = len(chunk)
+        b[:amt] = chunk
+        return amt
+
+    def readinto1(self, b: Any) -> int:
+        return self.readinto(b)
 
 
 class CancellableHTTPResponse(http.client.HTTPResponse):
     def __init__(
         self,
         sock: socket.socket,
-        prefetched_data: bytes,
+        stream: CancellableResponseStream,
         method: str | None = None,
     ) -> None:
         super().__init__(sock, method=method)
-        underlying = self.fp
-        buf = io.BytesIO(prefetched_data)
-        self.buffered_io = buf
-        self.prefetched_length = len(prefetched_data)
-
-        class ChainedStream(io.RawIOBase):
-            def readable(self) -> bool:
-                return True
-
-            def readinto(self, b: Any) -> int:
-                n = buf.readinto(b)
-                if n > 0:
-                    return int(n)
-                return int(underlying.readinto(b))
-
-            def close(self) -> None:
-                underlying.close()
-
-        self.fp = io.BufferedReader(ChainedStream())
+        self.stream = stream
+        self.fp = stream
 
     def has_buffered_data(self) -> bool:
-        return self.buffered_io.tell() < self.prefetched_length
+        return self.stream.has_buffered_data()
+
+    def begin(self) -> None:
+        if self.headers is not None:
+            return
+
+        for _ in range(http.client._MAXINTERIMRESPONSES):
+            version, status, reason = self._read_status()
+            if status < 100 or status >= 200 or status == 101:
+                break
+            skipped_headers = http.client._read_headers(self.fp)
+            del skipped_headers
+        else:
+            raise http.client.HTTPException("Too many interim responses")
+
+        self.code = self.status = status
+        self.reason = reason.strip()
+        if version in ("HTTP/1.0", "HTTP/0.9"):
+            self.version = 10
+        elif version.startswith("HTTP/1."):
+            self.version = 11
+        else:
+            raise http.client.UnknownProtocol(version)
+
+        self.headers = self.msg = http.client.parse_headers(self.fp)
+        self.stream.is_reading_headers = False
+
+        tr_enc = self.headers.get("transfer-encoding")
+        if tr_enc and tr_enc.lower() == "chunked":
+            self.chunked = True
+            self.chunk_left = None
+        else:
+            self.chunked = False
+
+        self.will_close = self._check_close()
+
+        self.length = None
+        length = self.headers.get("content-length")
+        if length and not self.chunked:
+            try:
+                self.length = int(length)
+            except ValueError:
+                self.length = None
+            else:
+                if self.length < 0:
+                    self.length = None
+        else:
+            self.length = None
+
+        if (
+            status == http.client.NO_CONTENT
+            or status == http.client.NOT_MODIFIED
+            or (100 <= status < 200)
+            or self._method == "HEAD"
+        ):
+            self.length = 0
+
+        if not self.will_close and not self.chunked and self.length is None:
+            self.will_close = True
 
 
 class DirectIPHTTPConnection(http.client.HTTPConnection):
@@ -185,11 +305,13 @@ class DirectIPHTTPConnection(http.client.HTTPConnection):
         target_ip: str,
         connect_timeout: float,
         read_timeout: float,
+        cancellation_token: CancellationToken | None = None,
     ) -> None:
         super().__init__(host, port, timeout=read_timeout)
         self.target_ip = target_ip
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
+        self.cancellation_token = cancellation_token or CancellationToken()
 
     def connect(self) -> None:
         self.sock = socket.create_connection(
@@ -198,8 +320,59 @@ class DirectIPHTTPConnection(http.client.HTTPConnection):
         )
         self.sock.settimeout(self.read_timeout)
 
+    def send(self, data: Any) -> None:
+        if self.sock is None:
+            if self.auto_open:
+                self.connect()
+            else:
+                raise http.client.NotConnected()
 
-class DirectIPHTTPSConnection(http.client.HTTPSConnection):
+        if hasattr(data, "read"):
+            while datablock := data.read(self.blocksize):
+                if isinstance(datablock, str):
+                    datablock = datablock.encode("iso-8859-1")
+                self._send_cancellable(datablock)
+            return
+
+        if isinstance(data, str):
+            data = data.encode("iso-8859-1")
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            self._send_cancellable(bytes(data))
+            return
+
+        if isinstance(data, collections.abc.Iterable):
+            for d in data:
+                if isinstance(d, str):
+                    d = d.encode("iso-8859-1")
+                self._send_cancellable(bytes(d))
+            return
+
+        raise TypeError(f"data should be a bytes-like object or an iterable, got {type(data)}")
+
+    def _send_cancellable(self, data: bytes) -> None:
+        if not data or self.sock is None:
+            return
+        total_sent = 0
+        total_len = len(data)
+        start_time = time.monotonic()
+        while total_sent < total_len:
+            self.cancellation_token.check_cancelled()
+            elapsed = time.monotonic() - start_time
+            remaining = self.read_timeout - elapsed
+            if remaining <= 0:
+                raise TimeoutExecutionError("HTTP timeout sending request data")
+            wait_time = min(0.05, remaining)
+            _, wlist, _ = select.select([], [self.sock], [], wait_time)
+            if not wlist:
+                continue
+            chunk = data[total_sent : total_sent + 65536]
+            sent = self.sock.send(chunk)
+            if sent == 0:
+                raise RetryableExecutionError("Socket connection broken during send")
+            total_sent += sent
+
+
+class DirectIPHTTPSConnection(DirectIPHTTPConnection):
     def __init__(
         self,
         host: str,
@@ -208,22 +381,26 @@ class DirectIPHTTPSConnection(http.client.HTTPSConnection):
         connect_timeout: float,
         read_timeout: float,
         ssl_context: ssl.SSLContext | None = None,
+        cancellation_token: CancellationToken | None = None,
     ) -> None:
-        ctx = ssl_context or ssl.create_default_context()
-        super().__init__(host, port, timeout=read_timeout, context=ctx)
-        self.target_ip = target_ip
-        self.connect_timeout = connect_timeout
-        self.read_timeout = read_timeout
-        self.ssl_context = ctx
+        super().__init__(
+            host=host,
+            port=port,
+            target_ip=target_ip,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            cancellation_token=cancellation_token,
+        )
+        self.ssl_context = ssl_context or ssl.create_default_context()
 
     def connect(self) -> None:
         self.sock = socket.create_connection(
             (self.target_ip, self.port),
             timeout=self.connect_timeout,
         )
-        self.sock.settimeout(self.read_timeout)
         server_hostname = self.host
         self.sock = self.ssl_context.wrap_socket(self.sock, server_hostname=server_hostname)
+        self.sock.settimeout(self.read_timeout)
 
 
 @dataclass(frozen=True)
@@ -233,6 +410,7 @@ class HttpSecurityPolicy:
     allow_loopback_for_testing: bool = False
     max_redirects: int = 5
     max_response_bytes: int = 10 * 1024 * 1024
+    max_response_header_bytes: int = 64 * 1024
     connect_timeout_seconds: float = 5.0
     read_timeout_seconds: float = 10.0
 
@@ -295,6 +473,12 @@ class HttpNodeExecutor:
         max_bytes = _resolve_bounded_max_bytes(
             config.get("max_response_bytes"),
             policy.max_response_bytes,
+            "max_response_bytes",
+        )
+        max_header_bytes = _resolve_bounded_max_bytes(
+            config.get("max_response_header_bytes"),
+            policy.max_response_header_bytes,
+            "max_response_header_bytes",
         )
         fail_on_error = bool(config.get("fail_on_error_status", True))
 
@@ -352,6 +536,7 @@ class HttpNodeExecutor:
                     connect_timeout=connect_timeout,
                     read_timeout=read_timeout,
                     ssl_context=ssl_ctx,
+                    cancellation_token=context.cancellation_token,
                 )
             else:
                 conn = DirectIPHTTPConnection(
@@ -360,6 +545,7 @@ class HttpNodeExecutor:
                     target_ip=target_ip,
                     connect_timeout=connect_timeout,
                     read_timeout=read_timeout,
+                    cancellation_token=context.cancellation_token,
                 )
 
             try:
@@ -378,14 +564,13 @@ class HttpNodeExecutor:
                 if conn.sock is None:
                     raise RetryableExecutionError("Socket connection not available")
 
-                prefetched = _read_headers_cancellation_aware(
-                    conn.sock, read_timeout, context.cancellation_token
+                stream = CancellableResponseStream(
+                    sock=conn.sock,
+                    token=context.cancellation_token,
+                    read_timeout=read_timeout,
+                    max_header_bytes=max_header_bytes,
                 )
-                context.cancellation_token.check_cancelled()
-
-                response = CancellableHTTPResponse(
-                    conn.sock, prefetched_data=prefetched, method=current_method
-                )
+                response = CancellableHTTPResponse(conn.sock, stream=stream, method=current_method)
                 response.begin()
 
                 if response.status in (301, 302, 303, 307, 308):
@@ -407,9 +592,7 @@ class HttpNodeExecutor:
 
                 response_headers = {k.lower(): v for k, v in response.getheaders()}
 
-                raw_bytes = self._read_bounded_response(
-                    response, conn.sock, max_bytes, read_timeout, context
-                )
+                raw_bytes = self._read_bounded_response(response, max_bytes, context)
                 conn.close()
 
                 text_content = raw_bytes.decode("utf-8", errors="replace")
@@ -511,7 +694,7 @@ class HttpNodeExecutor:
         return f"{scheme}://{net_host}:{port}"
 
     def _validate_origin_and_path(self, parsed: urllib.parse.SplitResult, origin: str) -> None:
-        allowed = [o.lower().rstrip("/") for o in self.policy.allowed_origins]
+        allowed = [str(o).lower().rstrip("/") for o in self.policy.allowed_origins]
         if not allowed:
             raise AllowlistViolationError(
                 f"URL origin '{origin}' is not permitted (no allowed origins configured)"
@@ -644,9 +827,7 @@ class HttpNodeExecutor:
     def _read_bounded_response(
         self,
         response: CancellableHTTPResponse,
-        sock: socket.socket | None,
         max_bytes: int,
-        read_timeout: float,
         context: ExecutionContext,
     ) -> bytes:
         content_length_str = response.getheader("Content-Length")
@@ -666,8 +847,6 @@ class HttpNodeExecutor:
         chunk_size = 65536
         while True:
             context.cancellation_token.check_cancelled()
-            if sock is not None and not response.has_buffered_data():
-                _wait_for_readable(sock, read_timeout, context.cancellation_token)
             chunk = response.read1(chunk_size)
             if not chunk:
                 break
