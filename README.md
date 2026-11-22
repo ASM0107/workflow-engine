@@ -114,7 +114,7 @@ React + TypeScript Canvas UI (Planned M6)
   - **Accurate Cancellation-Aware I/O & Persistent Connection Handling**:
     - *TCP Connection & TLS Handshake*: Timeout-bound, strictly governed by `connect_timeout` (ensuring TLS handshakes complete under `connect_timeout` rather than inheriting `read_timeout`), with cancellation checkpoints guarding each transition.
     - *Request Body Transmission*: Sliced into chunked socket sends with `select.select` in 50 ms polling intervals, checking `CancellationToken` before each chunk.
-    - *Response Header Consumption*: Custom `CancellableResponseStream` (subclassing `io.BufferedReader`) polls socket readability in 50 ms slices, enforces `max_response_header_bytes`, and natively parses/discards 1xx informational responses (100 Continue, 102 Processing, 103 Early Hints) without falling back to uninterruptible socket makefile reads.
+    - *Response Header Consumption*: Custom `CancellableResponseStream` (subclassing `io.BufferedReader`) polls socket readability in 50 ms slices, enforces incremental header budget ceilings (`max_response_header_bytes`), respects `size` limits during accumulation in `readline(size)` even when lines are unterminated, bounds socket reads to remaining header budgets to prevent memory overshoot, preserves body bytes arriving in the same socket read as the final header delimiter, and natively parses/discards 1xx informational responses (100 Continue, 102 Processing, 103 Early Hints) without falling back to uninterruptible socket makefile reads.
     - *Buffered-Body & Streaming Body Reads*: Unread bytes delivered with headers in persistent HTTP/1.1 keep-alive connections are accurately tracked in `stream.buffer`, returning immediately with 0 ms socket wait when buffered, and polling empty socket reads in 50 ms slices with immediate cancellation abort ($\le 100\text{ms}$).
   - **Dynamic Request Configuration**: Fully supports `SafeTemplateEngine` interpolation across URLs, headers, query parameters, JSON bodies, and raw data payloads, preserving native JSON scalar and structured types and re-validating rendered URLs against all SSRF policies.
 - **Safe Declarative Transformations**:
@@ -134,12 +134,12 @@ React + TypeScript Canvas UI (Planned M6)
 | **M2: PostgreSQL Persistence** | Schema, Alembic migrations, partial indexes, atomic run creation, repositories | **Completed** | 18 integration tests, 98% coverage |
 | **M3: Worker Engine** | Run-first locking, fair candidate discovery, atomic claiming, fenced leases, heartbeats, sweeper recovery | **Completed** | 27 integration & crash tests, 95% coverage |
 | **M4: DAG Execution** | Strict lock hierarchy (`runs` $\to$ `node_runs` $\to$ `edge_runs`), edge states, branch evaluation, reconvergent joins, multi-hop skips, terminal detection | **Completed** | 45 integration, lock ordering & oracle tests, 95% coverage |
-| **M5: Node Execution Adapters & External Integrations** | Executor registry & dispatch, secure HTTP adapter, SSRF safeguards, resource ceilings, path boundary matching, credential stripping, templating, in-flight cancellation, JMESPath | **Completed** | 139 adapter & integration tests, 93% coverage |
+| **M5: Node Execution Adapters & External Integrations** | Executor registry & dispatch, secure HTTP adapter, SSRF safeguards, resource ceilings, path boundary matching, credential stripping, templating, in-flight cancellation, incremental header budgeting, JMESPath | **Completed** | 144 adapter & integration tests, 93% coverage |
 | **M6: REST API & Canvas UI** | FastAPI routes, WebSockets execution stream, React canvas editor | *Awaiting Authorization* | Planned |
 | **M7: Deployment & Acceptance** | Docker Compose orchestration, comprehensive end-to-end integration, benchmarks | *Pending M6* | Planned |
 
 > [!IMPORTANT]
-> **Milestone Status Notice**: Milestones M0, M1, M2, M3, M4, and M5 are fully implemented and verified against real PostgreSQL 18 (283/283 passing tests, 93% code coverage). Milestone M6 is awaiting human authorization before implementation begins.
+> **Milestone Status Notice**: Milestones M0, M1, M2, M3, M4, and M5 are fully implemented and verified against real PostgreSQL 18 (288/288 passing tests, 93% code coverage). Milestone M6 is awaiting human authorization before implementation begins.
 
 ---
 

@@ -130,7 +130,25 @@ class CancellableResponseStream(io.BufferedReader):
         if not self.closed:
             super().close()
 
-    def _fill_buffer(self) -> int:
+    def _get_buffered_header_length(self) -> int | None:
+        if self.total_header_bytes > 0:
+            if self.buffer.startswith(b"\r\n"):
+                return 2
+            if self.buffer.startswith(b"\n"):
+                return 1
+        idx_crlf = self.buffer.find(b"\r\n\r\n")
+        idx_lf = self.buffer.find(b"\n\n")
+        if idx_crlf >= 0 and idx_lf >= 0:
+            if idx_crlf <= idx_lf:
+                return idx_crlf + 4
+            return idx_lf + 2
+        if idx_crlf >= 0:
+            return idx_crlf + 4
+        if idx_lf >= 0:
+            return idx_lf + 2
+        return None
+
+    def _fill_buffer(self, limit: int = -1) -> int:
         start_time = time.monotonic()
         while True:
             self.token.check_cancelled()
@@ -138,6 +156,27 @@ class CancellableResponseStream(io.BufferedReader):
             remaining = self.read_timeout - elapsed
             if remaining <= 0:
                 raise TimeoutExecutionError("HTTP timeout reading from socket")
+
+            max_recv = 65536
+            if self.is_reading_headers:
+                header_len = self._get_buffered_header_length()
+                if header_len is not None:
+                    if self.total_header_bytes + header_len > self.max_header_bytes:
+                        raise ResponseSizeLimitExceededError(
+                            f"Response headers exceeded limit of {self.max_header_bytes} bytes"
+                        )
+                else:
+                    accumulated = self.total_header_bytes + len(self.buffer)
+                    remaining_budget = self.max_header_bytes - accumulated
+                    if remaining_budget <= 0:
+                        raise ResponseSizeLimitExceededError(
+                            f"Response headers exceeded limit of {self.max_header_bytes} bytes"
+                        )
+                    max_recv = min(max_recv, remaining_budget + 1)
+
+            if limit >= 0:
+                needed = max(1, (limit - len(self.buffer)) + 1)
+                max_recv = min(max_recv, needed)
 
             if isinstance(self.sock, ssl.SSLSocket) and self.sock.pending() > 0:
                 can_read = True
@@ -147,10 +186,22 @@ class CancellableResponseStream(io.BufferedReader):
                 can_read = bool(rlist)
 
             if can_read:
-                chunk = self.sock.recv(65536)
+                chunk = self.sock.recv(max_recv)
                 if not chunk:
                     return 0
                 self.buffer.extend(chunk)
+                if self.is_reading_headers:
+                    header_len = self._get_buffered_header_length()
+                    if header_len is not None:
+                        if self.total_header_bytes + header_len > self.max_header_bytes:
+                            raise ResponseSizeLimitExceededError(
+                                f"Response headers exceeded limit of {self.max_header_bytes} bytes"
+                            )
+                    else:
+                        if self.total_header_bytes + len(self.buffer) > self.max_header_bytes:
+                            raise ResponseSizeLimitExceededError(
+                                f"Response headers exceeded limit of {self.max_header_bytes} bytes"
+                            )
                 return len(chunk)
 
     def readline(self, size: int | None = -1) -> bytes:
@@ -171,7 +222,18 @@ class CancellableResponseStream(io.BufferedReader):
                         )
                 return chunk
 
-            n = self._fill_buffer()
+            if limit >= 0 and len(self.buffer) >= limit:
+                chunk = bytes(self.buffer[:limit])
+                del self.buffer[:limit]
+                if self.is_reading_headers:
+                    self.total_header_bytes += len(chunk)
+                    if self.total_header_bytes > self.max_header_bytes:
+                        raise ResponseSizeLimitExceededError(
+                            f"Response headers exceeded limit of {self.max_header_bytes} bytes"
+                        )
+                return chunk
+
+            n = self._fill_buffer(limit=limit)
             if n == 0:
                 amt = len(self.buffer) if limit < 0 else min(limit, len(self.buffer))
                 chunk = bytes(self.buffer[:amt])

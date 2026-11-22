@@ -76,6 +76,37 @@ class LimitsServerHandler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/oversized_headers":
             self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Long-Header: " + (b"A" * 70000) + b"\r\n\r\nOK")
             self.wfile.flush()
+        elif self.path == "/unterminated_header":
+            try:
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Bad: ")
+                self.wfile.flush()
+                for _ in range(500):
+                    self.wfile.write(b"A" * 1024)
+                    self.wfile.flush()
+                    time.sleep(0.01)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        elif self.path == "/aggregate_headers_overflow":
+            try:
+                self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+                for i in range(50):
+                    self.wfile.write(f"X-Hdr-{i:03d}: 1234567890\r\n".encode())
+                self.wfile.write(b"\r\nOK")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        elif self.path == "/header_and_body_single_packet":
+            try:
+                payload = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"Content-Length: 12\r\n\r\n"
+                    b"Hello World!"
+                )
+                self.wfile.write(payload)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         elif self.path == "/interim_100_then_200":
             self.wfile.write(
                 b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
@@ -776,3 +807,172 @@ def test_direct_ip_http_connection_send_types() -> None:
         conn.send("string-data")
         conn.send([b"chunk1", "chunk2"])
         conn.send(io.BytesIO(b"file-like"))
+
+
+def test_unterminated_response_header_aborts_promptly(limits_server: LimitsServer) -> None:
+    policy = HttpSecurityPolicy(
+        allowed_origins=[str(limits_server)],
+        allow_loopback_for_testing=True,
+        max_response_header_bytes=1024,
+    )
+    executor = HttpNodeExecutor(policy)
+    token = CancellationToken()
+    context = ExecutionContext(
+        run_id="run-unterminated-header",
+        node_key="unterminated_header_node",
+        node_type=NodeType.HTTP,
+        config={
+            "url": f"{limits_server}/unterminated_header",
+            "method": "GET",
+            "max_response_header_bytes": 1024,
+        },
+        inputs={},
+        cancellation_token=token,
+    )
+
+    start_time = time.monotonic()
+    with pytest.raises(ResponseSizeLimitExceededError, match="Response headers exceeded limit"):
+        executor.execute(context)
+    elapsed = time.monotonic() - start_time
+    assert elapsed < 1.0
+
+
+def test_multiple_headers_collectively_exceeding_budget_aborted(
+    limits_server: LimitsServer,
+) -> None:
+    policy = HttpSecurityPolicy(
+        allowed_origins=[str(limits_server)],
+        allow_loopback_for_testing=True,
+        max_response_header_bytes=512,
+    )
+    executor = HttpNodeExecutor(policy)
+    token = CancellationToken()
+    context = ExecutionContext(
+        run_id="run-aggregate-headers",
+        node_key="aggregate_headers_node",
+        node_type=NodeType.HTTP,
+        config={
+            "url": f"{limits_server}/aggregate_headers_overflow",
+            "method": "GET",
+            "max_response_header_bytes": 512,
+        },
+        inputs={},
+        cancellation_token=token,
+    )
+
+    with pytest.raises(ResponseSizeLimitExceededError, match="Response headers exceeded limit"):
+        executor.execute(context)
+
+
+def test_body_bytes_preserved_when_received_with_final_header(
+    limits_server: LimitsServer,
+) -> None:
+    policy = HttpSecurityPolicy(
+        allowed_origins=[str(limits_server)],
+        allow_loopback_for_testing=True,
+        max_response_header_bytes=65,
+    )
+    executor = HttpNodeExecutor(policy)
+    token = CancellationToken()
+    context = ExecutionContext(
+        run_id="run-header-body-preserve",
+        node_key="header_body_preserve_node",
+        node_type=NodeType.HTTP,
+        config={
+            "url": f"{limits_server}/header_and_body_single_packet",
+            "method": "GET",
+            "max_response_header_bytes": 65,
+        },
+        inputs={},
+        cancellation_token=token,
+    )
+
+    result = executor.execute(context)
+    assert result.output["status_code"] == 200
+    assert result.output["body"] == "Hello World!"
+
+
+def test_cancellable_response_stream_readline_honours_size_without_newline() -> None:
+    from workflow_engine.adapters.http_adapter import CancellableResponseStream
+
+    client_sock, server_sock = socket.socketpair()
+    try:
+        token = CancellationToken()
+        stream = CancellableResponseStream(client_sock, token, read_timeout=1.0)
+        stream.buffer.extend(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+        assert stream.readline(5) == b"ABCDE"
+        assert stream.buffer == bytearray(b"FGHIJKLMNOPQRSTUVWXYZ")
+        assert stream.readline(10) == b"FGHIJKLMNO"
+        assert stream.buffer == bytearray(b"PQRSTUVWXYZ")
+        assert stream.readline(0) == b""
+        assert stream.buffer == bytearray(b"PQRSTUVWXYZ")
+
+        server_sock.close()
+        assert stream.readline(20) == b"PQRSTUVWXYZ"
+        assert stream.buffer == bytearray(b"")
+        stream.close()
+    finally:
+        client_sock.close()
+
+    client_sock2, server_sock2 = socket.socketpair()
+    try:
+        stream2 = CancellableResponseStream(client_sock2, token, read_timeout=1.0)
+        server_sock2.sendall(b"1234567890abcdefghijKLMNOPQRST")
+        assert stream2.readline(10) == b"1234567890"
+        assert stream2.readline(10) == b"abcdefghij"
+        assert stream2.readline(10) == b"KLMNOPQRST"
+        stream2.close()
+    finally:
+        server_sock2.close()
+        client_sock2.close()
+
+
+def test_cancellable_response_stream_header_budget_and_delimiters() -> None:
+    from workflow_engine.adapters.http_adapter import CancellableResponseStream
+
+    s = socket.socket()
+    token = CancellationToken()
+    stream = CancellableResponseStream(s, token, read_timeout=1.0, max_header_bytes=10)
+
+    stream.total_header_bytes = 5
+    stream.buffer = bytearray(b"\r\nbody")
+    assert stream._get_buffered_header_length() == 2
+
+    stream.buffer = bytearray(b"\nbody")
+    assert stream._get_buffered_header_length() == 1
+
+    stream.buffer = bytearray(b"hdr\n\nbody")
+    assert stream._get_buffered_header_length() == 5
+
+    stream.buffer = bytearray(b"hdr\r\n\r\nbody\n\nmore")
+    assert stream._get_buffered_header_length() == 7
+
+    stream.buffer = bytearray(b"hdr\n\nbody\r\n\r\nmore")
+    assert stream._get_buffered_header_length() == 5
+
+    stream.total_header_bytes = 10
+    stream.buffer = bytearray(b"hdr")
+    with pytest.raises(ResponseSizeLimitExceededError, match="Response headers exceeded limit"):
+        stream._fill_buffer()
+
+    stream.total_header_bytes = 5
+    stream.buffer = bytearray(b"hdr\r\n\r\nbody")
+    with pytest.raises(ResponseSizeLimitExceededError, match="Response headers exceeded limit"):
+        stream._fill_buffer()
+
+    stream.close()
+    s.close()
+
+    client_sock, server_sock = socket.socketpair()
+    try:
+        stream_overshoot = CancellableResponseStream(
+            client_sock, token, read_timeout=1.0, max_header_bytes=10
+        )
+        server_sock.sendall(b"header: overflow\r\n\r\nbody")
+        with pytest.raises(ResponseSizeLimitExceededError, match="Response headers exceeded limit"):
+            stream_overshoot.readline()
+        stream_overshoot.close()
+    finally:
+        server_sock.close()
+        client_sock.close()
